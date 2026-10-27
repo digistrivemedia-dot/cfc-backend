@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets. .env.example is the template that IS committed.
+.env
+.env*.local
+
+# Uploaded files — user content, never committed. `private/` holds KYC
+# documents, which must not reach a repository under any circumstances.
+uploads/
+
+.DS_Store
+npm-debug.log*
+.pnpm-debug.log*

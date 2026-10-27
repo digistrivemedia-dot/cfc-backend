@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  // Mirrors cfc-frontend/frontend/packages/config/tsconfig-base.json rather
+  // than extending it, so this project installs no frontend tooling (that
+  // package depends on tailwind). The strictness flags have to match: @cfc/types
+  // is linked in and type-checked here, and under different settings the same
+  // file would pass in one project and fail in the other.
+  //
+  // `DOM` is deliberately absent — it is in the frontend's list and a server has
+  // no business referencing a browser global. Node 22's own types cover fetch.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "uploads"]
+}

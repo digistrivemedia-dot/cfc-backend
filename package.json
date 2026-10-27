@@ -1,0 +1,36 @@
+{
+  "name": "cfc-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CFC platform API — Node + Express + MongoDB Atlas. Serves the consumer, pro and admin apps in ../cfc-frontend.",
+  "_comment_type": "No \"type\": \"module\" on purpose. @cfc/types declares no module type, so tsx compiles it as CJS; declaring this project ESM puts a dual-module boundary between them and `export * from` chains stop static-linking across it (ApiError resolves as undefined). Matching it means runtime values from @cfc/types import normally, which BACKEND-PLAN.md §9 depends on — permission.ts, the GST constants and the earnings engine are ported, not re-derived.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "test": "tsx src/selfcheck.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cfc/types": "link:../cfc-frontend/frontend/packages/types",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^8.9.5",
+    "multer": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^22.20.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
