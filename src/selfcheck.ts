@@ -16,6 +16,8 @@ import { Coupon } from "./models/coupon";
 import { WalletEntry } from "./models/wallet";
 import { DispatchAlert, Offer } from "./models/offer";
 import { Quotation } from "./models/quotation";
+import { ProLedger } from "./models/pro-ledger";
+import { Payout } from "./services/payout";
 
 /**
  * Stage A's runnable check. `pnpm --filter @cfc/server test`
@@ -137,6 +139,7 @@ async function main(): Promise<void> {
     await checkDispatch(base, token, check);
     await checkLifecycle(base, token, check);
     await checkQuotations(base, token, check);
+    await checkEarnings(base, token, check);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await disconnect();
@@ -1394,6 +1397,33 @@ async function checkBooking(
       assert.equal(bookingCount, 1, "the retry created a second booking");
     });
 
+    // Two deliberate bookings of the same service, slot and address, with
+    // **different keys**, must both exist.
+    //
+    // The mock layer's fallback key derives from the draft plus a minute
+    // bucket, so without a caller-supplied key these two collapse into one and
+    // the second request silently returns the first's reference. That ceiling
+    // was written off as hypothetical and then hit within the hour.
+    const twinA = await call("POST", "/consumer/bookings", {
+      serviceId, addressId, startsAt: tomorrow, paymentMethod: "cash",
+      idempotencyKey: `twin-a-${Date.now()}`,
+    }, custToken);
+    const twinB = await call("POST", "/consumer/bookings", {
+      serviceId, addressId, startsAt: tomorrow, paymentMethod: "cash",
+      idempotencyKey: `twin-b-${Date.now()}`,
+    }, custToken);
+    const twinARef = ((await twinA.json()) as { reference?: string }).reference;
+    const twinBRef = ((await twinB.json()) as { reference?: string }).reference;
+    check("two deliberate bookings with different keys are both created", () => {
+      assert.equal(twinA.status, 201);
+      assert.equal(twinB.status, 201);
+      assert.notEqual(
+        twinARef,
+        twinBRef,
+        "a second deliberate booking was collapsed into the first",
+      );
+    });
+
     const exhausted = await call("POST", "/consumer/bookings", {
       serviceId, addressId, startsAt: tomorrow, paymentMethod: "cash",
       couponCode: code, idempotencyKey: `${key}-2`,
@@ -1440,8 +1470,12 @@ async function checkBooking(
       await call("GET", "/consumer/bookings/counts", undefined, custToken)
     ).json()) as Record<string, number>;
     check("a pending booking counts under Upcoming", () => {
-      assert.equal(counts["upcoming"], 1);
+      // Three bookings exist by now — the original plus the two twins above —
+      // so this asserts the *grouping*, which is what the tab mapping is for,
+      // rather than a literal that any added fixture would break.
+      assert.equal(counts["upcoming"], 3);
       assert.equal(counts["ongoing"], 0);
+      assert.equal(counts["completed"], 0);
     });
 
     const active = (await (
@@ -2987,6 +3021,525 @@ async function checkQuotations(
     await WalletEntry.deleteMany({ customerId });
     await Customer.deleteOne({ phone: custPhone });
     await Pro.deleteMany({ phone: proPhone });
+    if (serviceId) await call("DELETE", `/admin/catalog/services/${serviceId}`, undefined, adminToken);
+    if (subCategoryId) await call("DELETE", `/admin/catalog/sub-categories/${subCategoryId}`, undefined, adminToken);
+    if (categoryId) await call("DELETE", `/admin/catalog/categories/${categoryId}`, undefined, adminToken);
+    resetRateLimits();
+  }
+}
+
+/**
+ * Phase 9a — pro earnings and payouts.
+ *
+ * Two properties carry the weight:
+ *
+ *   **the summary and the chart must agree.** `PRO-OPEN-ITEMS` 4.4 records a
+ *   ₹1,205 disagreement about a pro's own income from two defensible cutoffs,
+ *   so the check sums the series and compares it to the headline.
+ *
+ *   **pending is not available.** Money inside the 48-hour window must not be
+ *   withdrawable, or a pro is shown a figure they cannot take.
+ */
+async function checkEarnings(
+  base: string,
+  adminToken: string,
+  check: (name: string, fn: () => void) => void,
+): Promise<void> {
+  console.info("[selfcheck] pro earnings and payouts");
+
+  const api = (p: string) => `${base}/api${p}`;
+  const call = (method: string, p: string, body?: unknown, token?: string) =>
+    fetch(api(p), {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  const stamp = String(Date.now()).slice(-8);
+  const custPhone = `+9168${stamp}`;
+  const proPhone = `+9167${stamp}`;
+
+  let categoryId = "";
+  let subCategoryId = "";
+  let serviceId = "";
+  let proToken = "";
+  let proId = "";
+  let custToken = "";
+
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  const upload = (path: string, fields: Record<string, string>, token: string) => {
+    const form = new FormData();
+    form.append("file", new Blob([png], { type: "image/png" }), "shot.png");
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    return fetch(api(path), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
+  };
+
+  resetRateLimits();
+
+  try {
+    // -- setup ---------------------------------------------------------------
+    const cat = (await (
+      await call("POST", "/admin/catalog/categories", { name: `__earn ${stamp}` }, adminToken)
+    ).json()) as { id: string };
+    categoryId = cat.id;
+    const sub = (await (
+      await call("POST", "/admin/catalog/sub-categories", { name: "__earn sub", categoryId }, adminToken)
+    ).json()) as { id: string };
+    subCategoryId = sub.id;
+    const svc = (await (
+      await call("POST", "/admin/catalog/services", {
+        name: "__earn service", subCategoryId,
+        basePricePaise: 200_000, platformFeePaise: 20_000,
+        variants: [{ name: "Standard", priceDeltaPaise: 0, durationMinutes: 60, isDefault: true }],
+      }, adminToken)
+    ).json()) as { id: string };
+    serviceId = svc.id;
+
+    await call("POST", "/pro/otp/send", { phone: proPhone });
+    const pv = (await (
+      await call("POST", "/pro/otp/verify", { phone: proPhone, code: env.masterOtp })
+    ).json()) as { token?: string };
+    const reg = (await (
+      await call("POST", "/pro/register", {
+        name: "Earn Pro", serviceIds: [serviceId], areas: ["Srirangam"],
+      }, pv.token)
+    ).json()) as { proId?: string; token?: string };
+    proId = reg.proId ?? "";
+    proToken = reg.token ?? pv.token ?? "";
+    assert.ok(proId && proToken, "earnings setup: pro registration failed");
+
+    for (const type of ["aadhaar_front", "aadhaar_back", "pan", "selfie"]) {
+      await upload("/pro/documents", { type }, proToken);
+      await call("PATCH", `/admin/pros/${proId}/documents/${type}`, { status: "approved" }, adminToken);
+    }
+    await call("PUT", "/pro/bank", {
+      accountName: "Earn Pro", accountNumber: "123456789012",
+      ifsc: "HDFC0001234", upiId: "earnpro@okhdfc",
+    }, proToken);
+    await call("POST", "/pro/conduct", {}, proToken);
+    await call("POST", `/admin/pros/${proId}/approve`, {}, adminToken);
+    await call("PUT", "/pro/online", { online: true }, proToken);
+
+    await call("POST", "/consumer/auth/otp/send", { phone: custPhone });
+    custToken = ((await (
+      await call("POST", "/consumer/auth/otp/verify", { phone: custPhone, code: env.masterOtp })
+    ).json()) as { token?: string }).token ?? "";
+    const addr = (await (
+      await call("PUT", "/consumer/addresses", {
+        label: "home", line1: "42 Kaveri Nagar", area: "Srirangam",
+        city: "Tiruchirappalli", state: "Tamil Nadu", pincode: "620006",
+        point: { lat: 10.85, lng: 78.68 },
+      }, custToken)
+    ).json()) as { id: string };
+
+    // -- nothing earned yet --------------------------------------------------
+    const empty = (await (
+      await call("GET", "/pro/earnings/balance", undefined, proToken)
+    ).json()) as { availablePaise?: number; pendingPaise?: number; canWithdraw?: boolean };
+    check("a new pro has nothing available and cannot withdraw", () => {
+      assert.equal(empty.availablePaise, 0);
+      assert.equal(empty.pendingPaise, 0);
+      assert.equal(empty.canWithdraw, false);
+    });
+
+    const noMoney = (await (
+      await call("POST", "/pro/earnings/payout", { method: "bank" }, proToken)
+    ).json()) as { ok?: boolean; reason?: string };
+    check("requesting a payout with nothing earned is refused", () => {
+      assert.equal(noMoney.ok, false);
+      assert.equal(noMoney.reason, "nothing-available");
+    });
+
+    const freeLeft = (await (
+      await call("GET", "/pro/earnings/commission-free-remaining", undefined, proToken)
+    ).json()) as number;
+    check("a new pro has all 20 commission-free jobs left", () => {
+      assert.equal(freeLeft, 20);
+    });
+
+    // -- complete one job ----------------------------------------------------
+    const completeOne = async (idemSuffix: string) => {
+      await call("PUT", "/pro/online", { online: true }, proToken);
+      const bk = (await (
+        await call("POST", "/consumer/bookings", {
+          serviceId, addressId: addr.id,
+          startsAt: new Date(Date.now() + 26 * 3_600_000).toISOString(),
+          paymentMethod: "cash", idempotencyKey: `earn-${stamp}-${idemSuffix}`,
+        }, custToken)
+      ).json()) as { reference?: string };
+
+      await new Promise((r) => setTimeout(r, 400));
+      const offer = (await (
+        await call("GET", "/pro/offers/next", undefined, proToken)
+      ).json()) as { offerId?: string } | null;
+      assert.ok(offer?.offerId, `no offer for booking ${idemSuffix}`);
+      await call("POST", `/pro/offers/${offer.offerId}/accept`, {}, proToken);
+
+      const booking = await Booking.findOne({ reference: bk.reference }).lean();
+      const id = booking?._id ?? "";
+      await call("POST", `/pro/jobs/${id}/start`, {}, proToken);
+      await upload(`/pro/jobs/${id}/photos`, { stage: "after" }, proToken);
+      const done = (await (
+        await call("POST", `/pro/jobs/${id}/complete`, {
+          otp: booking?.completionOtp ?? "",
+        }, proToken)
+      ).json()) as { ok?: boolean; earning?: { netPaise?: number } };
+      assert.equal(done.ok, true, `completion ${idemSuffix} failed`);
+      return { bookingId: id, netPaise: done.earning?.netPaise ?? 0 };
+    };
+
+    const job1 = await completeOne("a");
+
+    const credited = await ProLedger.find({ proId, kind: "credit" }).lean();
+    check("completing a job credits the pro's wallet", () => {
+      // Until this existed, completion froze a settlement onto the booking and
+      // nothing ever read it — the figure was computed, stored and orphaned.
+      assert.equal(credited.length, 1);
+      assert.equal(credited[0]?.amountPaise, job1.netPaise);
+    });
+
+    check("the credit carries the 48-hour availability date", () => {
+      const hours =
+        ((credited[0]?.availableAt.getTime() ?? 0) - (credited[0]?.at.getTime() ?? 0)) /
+        3_600_000;
+      assert.equal(Math.round(hours), 48);
+    });
+
+    // -- the rule that matters: pending is not available ---------------------
+    const held = (await (
+      await call("GET", "/pro/earnings/balance", undefined, proToken)
+    ).json()) as { availablePaise?: number; pendingPaise?: number; canWithdraw?: boolean };
+    check("money inside the 48-hour window is pending, not available", () => {
+      // Conflating them shows a pro money they cannot take, and the support
+      // call arrives the moment they try.
+      assert.equal(held.availablePaise, 0, "freshly earned money was withdrawable");
+      assert.equal(held.pendingPaise, job1.netPaise);
+      assert.equal(held.canWithdraw, false);
+    });
+
+    const tooEarly = (await (
+      await call("POST", "/pro/earnings/payout", { method: "bank" }, proToken)
+    ).json()) as { ok?: boolean; reason?: string };
+    check("a payout cannot be requested against pending money", () => {
+      assert.equal(tooEarly.ok, false);
+    });
+
+    const pending = (await (
+      await call("GET", "/pro/earnings/pending", undefined, proToken)
+    ).json()) as { hoursRemaining?: number; overdue?: boolean; bookingReference?: string }[];
+    check("the pending screen says how long is left to wait", () => {
+      // A pro looking at a completed job with no payment needs to know whether
+      // to wait or to raise a ticket.
+      assert.equal(pending.length, 1);
+      assert.ok((pending[0]?.hoursRemaining ?? 0) > 47);
+      assert.equal(pending[0]?.overdue, false);
+    });
+
+    // -- the summary and the chart must agree --------------------------------
+    const complete2 = await completeOne("b");
+    const totalNet = job1.netPaise + complete2.netPaise;
+
+    const summary = (await (
+      await call("GET", "/pro/earnings/summary?period=week", undefined, proToken)
+    ).json()) as {
+      netPaise?: number;
+      grossPaise?: number;
+      cfcFeePaise?: number;
+      jobCount?: number;
+      commissionFreeJobs?: number;
+    };
+    const series = (await (
+      await call("GET", "/pro/earnings/series?period=week", undefined, proToken)
+    ).json()) as { netPaise: number; jobs: number }[];
+
+    check("the chart sums to exactly the headline figure", () => {
+      // PRO-OPEN-ITEMS 4.4: two defensible cutoffs showed a ₹1,205
+      // disagreement about the pro's own income on one screen. One function
+      // owns the cutoff now, and this is the assertion that holds it there.
+      const charted = series.reduce((t, p) => t + p.netPaise, 0);
+      assert.equal(
+        charted,
+        summary.netPaise,
+        `chart ${charted} vs headline ${summary.netPaise}`,
+      );
+    });
+
+    check("the job counts agree too", () => {
+      assert.equal(series.reduce((t, p) => t + p.jobs, 0), summary.jobCount);
+      assert.equal(summary.jobCount, 2);
+    });
+
+    check("gross, fee and net reconcile", () => {
+      // A settlement that does not add up is worse than a rupee.
+      assert.equal(
+        (summary.grossPaise ?? 0) - (summary.cfcFeePaise ?? 0),
+        summary.netPaise,
+      );
+    });
+
+    check("both jobs are commission-free under the first-20 offer", () => {
+      assert.equal(summary.cfcFeePaise, 0);
+      assert.equal(summary.commissionFreeJobs, 2);
+    });
+
+    const freeAfter = (await (
+      await call("GET", "/pro/earnings/commission-free-remaining", undefined, proToken)
+    ).json()) as number;
+    check("the commission-free counter comes down as jobs complete", () => {
+      assert.equal(freeAfter, 18);
+    });
+
+    const today = (await (
+      await call("GET", "/pro/earnings/summary?period=today", undefined, proToken)
+    ).json()) as { netPaise?: number };
+    check("today's figure is the same work, same arithmetic", () => {
+      assert.equal(today.netPaise, totalNet);
+    });
+
+    const badPeriod = await call(
+      "GET", "/pro/earnings/summary?period=fortnight", undefined, proToken,
+    );
+    check("an unknown period is refused rather than silently defaulted", () => {
+      assert.equal(badPeriod.status, 400);
+    });
+
+    // -- a commission-charged job -------------------------------------------
+    // Pushed past the free 20 so the 15% actually applies.
+    await Pro.updateOne({ _id: proId }, { $set: { jobsCompleted: 25 } });
+    const charged = await completeOne("c");
+
+    check("past the first 20 jobs, 15% commission is charged", () => {
+      // Gross here is ₹2,000, so the fee is ₹300 and the net ₹1,700.
+      assert.equal(charged.netPaise, 170_000);
+    });
+
+    const chargedRow = await ProLedger.findOne({
+      proId, bookingId: charged.bookingId, kind: "credit",
+    }).lean();
+    check("the ledger records the gross and the fee, not just the net", () => {
+      // A pro has to be able to see what was taken and why.
+      assert.equal(chargedRow?.grossPaise, 200_000);
+      assert.equal(chargedRow?.feePaise, 30_000);
+      assert.equal(chargedRow?.amountPaise, 170_000);
+    });
+
+    // -- make it available, then pay out ------------------------------------
+    // Backdated rather than waiting 48 real hours.
+    await ProLedger.updateMany(
+      { proId, kind: "credit" },
+      { $set: { availableAt: new Date(Date.now() - 1000) } },
+    );
+
+    const ready = (await (
+      await call("GET", "/pro/earnings/balance", undefined, proToken)
+    ).json()) as { availablePaise?: number; pendingPaise?: number; canWithdraw?: boolean };
+    check("once the window passes the money becomes available", () => {
+      assert.equal(ready.availablePaise, totalNet + charged.netPaise);
+      assert.equal(ready.pendingPaise, 0);
+      assert.equal(ready.canWithdraw, true);
+    });
+
+    const destinations = (await (
+      await call("GET", "/pro/earnings/destinations", undefined, proToken)
+    ).json()) as { kind: string; detail: string }[];
+    check("payout destinations show the last four, never the full account", () => {
+      assert.equal(destinations.length, 2);
+      const serialised = JSON.stringify(destinations);
+      assert.ok(
+        !serialised.includes("123456789012"),
+        `the full account number leaked: ${serialised}`,
+      );
+      assert.match(serialised, /9012/);
+    });
+
+    const requested = (await (
+      await call("POST", "/pro/earnings/payout", { method: "bank" }, proToken)
+    ).json()) as { ok?: boolean; amountPaise?: number; expectedBy?: string; payoutId?: string };
+    check("the pro can request the payout", () => {
+      assert.equal(requested.ok, true);
+      assert.equal(requested.amountPaise, ready.availablePaise);
+      assert.ok(requested.expectedBy, "no expected date given");
+    });
+
+    const afterRequest = (await (
+      await call("GET", "/pro/earnings/balance", undefined, proToken)
+    ).json()) as { availablePaise?: number; requestInFlight?: boolean };
+    check("requesting a payout empties the balance at once", () => {
+      // The balance is derived from the ledger, so the money has to leave the
+      // ledger — otherwise the same money could be requested twice before the
+      // first transfer settled.
+      assert.equal(afterRequest.availablePaise, 0);
+      assert.equal(afterRequest.requestInFlight, true);
+    });
+
+    const twice = (await (
+      await call("POST", "/pro/earnings/payout", { method: "bank" }, proToken)
+    ).json()) as { ok?: boolean; reason?: string };
+    check("a second payout while one is in flight is refused", () => {
+      assert.equal(twice.ok, false);
+    });
+
+    const proPayouts = (await (
+      await call("GET", "/pro/earnings/payouts", undefined, proToken)
+    ).json()) as { status?: string; paidAt?: string | null }[];
+    check("the pro is told 'pending', never 'paid'", () => {
+      // Claiming a completed transfer when it was only initiated produces a
+      // support call the moment the pro checks their bank.
+      assert.equal(proPayouts[0]?.status, "pending");
+      assert.equal(proPayouts[0]?.paidAt, null);
+    });
+
+    // -- the admin queue -----------------------------------------------------
+    const queue = (await (
+      await call("GET", "/admin/payouts?status=pending", undefined, adminToken)
+    ).json()) as { id: string; proName?: string; waitingHours?: number }[];
+    check("the payout reaches the admin queue with its waiting time", () => {
+      assert.ok(queue.some((p) => p.id === requested.payoutId));
+      assert.equal(typeof queue[0]?.waitingHours, "number");
+    });
+
+    const approved = (await (
+      await call("POST", "/admin/payouts/approve",
+        { payoutIds: [requested.payoutId] }, adminToken)
+    ).json()) as { approved?: string[]; skipped?: string[] };
+    check("an admin can approve a payout", () => {
+      assert.deepEqual(approved.approved, [requested.payoutId]);
+    });
+
+    const approveAgain = (await (
+      await call("POST", "/admin/payouts/approve",
+        { payoutIds: [requested.payoutId] }, adminToken)
+    ).json()) as { approved?: string[]; skipped?: string[] };
+    check("approving the same payout twice is skipped, not repeated", () => {
+      // Two operators working one queue must not both approve a transfer.
+      assert.deepEqual(approveAgain.approved, []);
+      assert.deepEqual(approveAgain.skipped, [requested.payoutId]);
+    });
+
+    // -- a rejection has to give the money back -----------------------------
+    await ProLedger.updateMany(
+      { proId, kind: "credit" },
+      { $set: { availableAt: new Date(Date.now() - 1000) } },
+    );
+    await Payout.updateOne({ _id: requested.payoutId }, { $set: { status: "paid" } });
+
+    // A fourth job, so there is a balance for the rejection path to return.
+    await completeOne("d");
+    await ProLedger.updateMany(
+      { proId, kind: "credit" },
+      { $set: { availableAt: new Date(Date.now() - 1000) } },
+    );
+    const second = (await (
+      await call("POST", "/pro/earnings/payout", { method: "upi" }, proToken)
+    ).json()) as { ok?: boolean; payoutId?: string; amountPaise?: number };
+    assert.equal(second.ok, true, "the second payout request failed");
+
+    const noReason = await call(
+      "POST", `/admin/payouts/${second.payoutId}/reject`, {}, adminToken,
+    );
+    check("rejecting a payout with no reason is refused", () => {
+      assert.equal(noReason.status, 400);
+    });
+
+    await call("POST", `/admin/payouts/${second.payoutId}/reject`,
+      { reason: "Bank details need confirming" }, adminToken);
+
+    const returned = (await (
+      await call("GET", "/pro/earnings/balance", undefined, proToken)
+    ).json()) as { availablePaise?: number };
+    check("a rejected payout returns the money to the wallet", () => {
+      // The request debited it. A rejection that only changed a status would
+      // leave the pro's money in neither the wallet nor a transfer.
+      assert.equal(returned.availablePaise, second.amountPaise);
+    });
+
+    // -- admin wallet adjustments -------------------------------------------
+    const adjustNoReason = await call(
+      "POST", `/admin/payouts/wallet/${proId}/adjust`, { amountPaise: 5_000 }, adminToken,
+    );
+    check("a wallet adjustment with no reason is refused", () => {
+      // An unexplained adjustment to someone's pay is the single most
+      // questionable row in this system.
+      assert.equal(adjustNoReason.status, 400);
+    });
+
+    const zeroAdjust = await call(
+      "POST", `/admin/payouts/wallet/${proId}/adjust`,
+      { amountPaise: 0, reason: "nothing" }, adminToken,
+    );
+    check("a zero adjustment is refused", () => {
+      assert.equal(zeroAdjust.status, 400);
+    });
+
+    const penalty = (await (
+      await call("POST", `/admin/payouts/wallet/${proId}/adjust`,
+        { amountPaise: -20_000, reason: "Late arrival penalty" }, adminToken)
+    ).json()) as { availablePaise?: number };
+    check("a penalty reduces the balance immediately", () => {
+      // Deferring it would let a pro withdraw money they already owe back.
+      assert.equal(penalty.availablePaise, (returned.availablePaise ?? 0) - 20_000);
+    });
+
+    const ledger = await ProLedger.find({ proId }).lean();
+    check("the penalty is a new row, never an edit of an existing one", () => {
+      assert.ok(ledger.some((r) => r.kind === "penalty" && r.amountPaise === -20_000));
+      // Every credit is still there, untouched.
+      assert.equal(ledger.filter((r) => r.kind === "credit").length, 4);
+    });
+
+    const wallet = (await (
+      await call("GET", `/admin/payouts/wallet/${proId}`, undefined, adminToken)
+    ).json()) as { entries?: unknown[]; availablePaise?: number };
+    check("the admin sees the pro's wallet job by job", () => {
+      assert.ok((wallet.entries?.length ?? 0) >= 6);
+    });
+
+    // -- a pro cannot read another pro's money ------------------------------
+    const otherPhone = `+9166${stamp}`;
+    await call("POST", "/pro/otp/send", { phone: otherPhone });
+    const otherVerify = (await (
+      await call("POST", "/pro/otp/verify", { phone: otherPhone, code: env.masterOtp })
+    ).json()) as { token?: string };
+    const otherReg = (await (
+      await call("POST", "/pro/register", {
+        name: "Other Earn Pro", serviceIds: [serviceId], areas: ["Srirangam"],
+      }, otherVerify.token)
+    ).json()) as { token?: string };
+
+    const otherBalance = (await (
+      await call("GET", "/pro/earnings/balance", undefined, otherReg.token)
+    ).json()) as { availablePaise?: number };
+    check("another pro's balance is their own, not a shared figure", () => {
+      // The id comes from the token, never a parameter, so there is nothing to
+      // tamper with — this asserts that holds.
+      assert.equal(otherBalance.availablePaise, 0);
+    });
+
+    const adminOnly = await call(
+      "GET", `/admin/payouts/wallet/${proId}`, undefined, otherReg.token,
+    );
+    check("a pro token cannot read the admin wallet view", () => {
+      assert.equal(adminOnly.status, 403);
+    });
+    await Pro.deleteOne({ phone: otherPhone });
+  } finally {
+    const mine = await Booking.find({ customerPhone: custPhone }).select({ _id: 1 }).lean();
+    await Offer.deleteMany({ bookingId: { $in: mine.map((b) => b._id) } });
+    await Booking.deleteMany({ customerPhone: custPhone });
+    await Customer.deleteOne({ phone: custPhone });
+    await ProLedger.deleteMany({ proId });
+    await Payout.deleteMany({ proId });
+    await Pro.deleteMany({ phone: { $in: [proPhone, `+9166${stamp}`] } });
     if (serviceId) await call("DELETE", `/admin/catalog/services/${serviceId}`, undefined, adminToken);
     if (subCategoryId) await call("DELETE", `/admin/catalog/sub-categories/${subCategoryId}`, undefined, adminToken);
     if (categoryId) await call("DELETE", `/admin/catalog/categories/${categoryId}`, undefined, adminToken);

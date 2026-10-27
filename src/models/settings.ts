@@ -55,6 +55,17 @@ export interface SettingsDoc {
    */
   gpsLimitMetres: number;
 
+  /**
+   * The smallest payout a pro may request, in paise.
+   *
+   * **Zero, and that is deliberate.** The inventory asks for a "minimum
+   * threshold" and the agreement never states one (§7.2, `PRO-OPEN-ITEMS` 1.2),
+   * so no figure is invented: zero means no threshold is shown. A screen saying
+   * "minimum ₹500" the client never agreed to is a commitment made by a
+   * developer.
+   */
+  payoutMinimumPaise: number;
+
   updatedAt: Date;
 }
 
@@ -67,6 +78,7 @@ const settingsSchema = new Schema<SettingsDoc>(
     slotStartHour: { type: Number, default: 8 },
     slotEndHour: { type: Number, default: 20 },
     gpsLimitMetres: { type: Number, default: 100 },
+    payoutMinimumPaise: { type: Number, default: 0 },
   },
   { timestamps: { createdAt: false, updatedAt: true }, versionKey: false },
 );
@@ -107,6 +119,7 @@ export async function getSettings(): Promise<SettingsDoc> {
     slotStartHour: doc?.slotStartHour ?? 8,
     slotEndHour: doc?.slotEndHour ?? 20,
     gpsLimitMetres: doc?.gpsLimitMetres ?? 100,
+    payoutMinimumPaise: doc?.payoutMinimumPaise ?? 0,
     updatedAt: doc?.updatedAt ?? new Date(),
   };
 }

@@ -3,6 +3,7 @@ import { Booking, canTransition, type BookingDoc } from "../models/booking";
 import { Pro, type ProDoc } from "../models/pro";
 import { getSettings } from "../models/settings";
 import { newId } from "../models/id";
+import { creditJob } from "./earnings";
 
 /**
  * Pro 13–19 — travelling, working, and closing the job.
@@ -258,6 +259,24 @@ export async function completeJob(input: {
     { _id: input.proId },
     { $inc: { jobsCompleted: 1 }, $set: { online: true } },
   );
+
+  /**
+   * The money reaches the pro's wallet.
+   *
+   * Until this existed, completion froze a settlement onto the booking and
+   * nothing ever read it — the figure was computed, stored, and orphaned. The
+   * credit carries its own 48-hour availability, and is idempotent on the job,
+   * so a retried completion cannot pay twice.
+   */
+  await creditJob({
+    proId: input.proId,
+    bookingId: updated._id,
+    bookingReference: updated.reference,
+    grossPaise: earning.grossPaise,
+    cfcFeePaise: earning.cfcFeePaise,
+    netPaise: earning.netPaise,
+    completedAt: at,
+  });
 
   return { ok: true, booking: updated, earning };
 }

@@ -10,8 +10,10 @@ import { adminCatalogRouter } from "./routes/admin/catalog";
 import { adminProsRouter } from "./routes/admin/pros";
 import { adminDispatchRouter } from "./routes/admin/dispatch";
 import { adminQuotationsRouter } from "./routes/admin/quotations";
+import { adminPayoutsRouter } from "./routes/admin/payouts";
 import { proOnboardingRouter } from "./routes/pro/onboarding";
 import { proJobsRouter } from "./routes/pro/jobs";
+import { proEarningsRouter } from "./routes/pro/earnings";
 import { consumerAuthRouter } from "./routes/consumer/auth";
 import { consumerAddressRouter } from "./routes/consumer/addresses";
 import { consumerBookingRouter } from "./routes/consumer/bookings";
@@ -94,6 +96,7 @@ export function createApp(): Express {
   app.use("/api/admin/pros", adminProsRouter);
   app.use("/api/admin/dispatch", adminDispatchRouter);
   app.use("/api/admin/quotations", adminQuotationsRouter);
+  app.use("/api/admin/payouts", adminPayoutsRouter);
 
   /**
    * Pro. Onboarding is partly unauthenticated by necessity — the OTP routes are
@@ -102,6 +105,7 @@ export function createApp(): Express {
    */
   app.use("/api/pro", proOnboardingRouter);
   app.use("/api/pro", proJobsRouter);
+  app.use("/api/pro/earnings", proEarningsRouter);
 
   /** Customer. Only the OTP routes are reachable without a token. */
   app.use("/api/consumer/auth", consumerAuthRouter);
