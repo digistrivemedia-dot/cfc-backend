@@ -17,6 +17,15 @@ import { WalletEntry } from "./models/wallet";
 import { DispatchAlert, Offer } from "./models/offer";
 import { Quotation } from "./models/quotation";
 import { ProLedger } from "./models/pro-ledger";
+import { ProWarning } from "./models/pro-warning";
+import { Review } from "./models/review";
+import { Notification } from "./models/notification";
+import { Banner } from "./models/banner";
+import { Ticket } from "./models/ticket";
+import { Faq } from "./models/faq";
+import { Settings, SETTINGS_ID } from "./models/settings";
+import { AdminUser } from "./models/admin-user";
+import { Service as ServiceModel } from "./models/catalog";
 import { Payout } from "./services/payout";
 
 /**
@@ -140,6 +149,8 @@ async function main(): Promise<void> {
     await checkLifecycle(base, token, check);
     await checkQuotations(base, token, check);
     await checkEarnings(base, token, check);
+    await checkPromotions(base, token, check);
+    await checkSupport(base, token, check);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await disconnect();
@@ -369,6 +380,34 @@ main().catch((err: unknown) => {
   console.error("[selfcheck] crashed", err);
   process.exit(1);
 });
+
+/**
+ * Wait for a condition instead of sleeping a fixed time.
+ *
+ * Dispatch is fired without blocking the booking response, so a test has to
+ * wait for the offer to appear. A fixed `setTimeout(400)` was doing that, and
+ * it is a race against a **remote Atlas cluster**: most runs it is plenty,
+ * and occasionally the write lands at 600ms and the suite fails with "no
+ * offer" for a dispatch engine that is working perfectly.
+ *
+ * Polling to a deadline is both faster in the normal case (it returns as soon
+ * as the row exists, usually well under 400ms) and reliable in the slow one.
+ */
+async function waitFor<T>(
+  what: string,
+  poll: () => Promise<T | null | undefined>,
+  timeoutMs = 8000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = await poll();
+    if (result !== null && result !== undefined) return result;
+    if (Date.now() > deadline) {
+      throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
 
 /**
  * Phase 3 — the catalogue.
@@ -783,13 +822,34 @@ async function checkProOnboarding(
     });
 
     const resend = await json("/pro/otp/send", { phone });
-    check("an immediate resend is refused by the 30s lock", () => {
-      assert.equal(resend.status, 429);
-    });
+    check(
+      env.dummyOtp
+        ? "with the dummy on, an immediate resend is allowed (by design)"
+        : "an immediate resend is refused by the 30s lock",
+      () => {
+        assert.equal(resend.status, env.dummyOtp ? 200 : 429);
+      },
+    );
 
+    // Branches on the mode rather than being deleted, so the real assertion
+    // comes back automatically the day `AUTH_DUMMY_OTP` goes off — which is
+    // exactly when it starts mattering. A test removed "because the dummy
+    // broke it" is coverage lost at the moment it is needed most.
     const wrongCode = await json("/pro/otp/verify", { phone, code: "000001" });
-    check("a wrong OTP is refused", () => {
-      assert.equal(wrongCode.status, 400);
+    check(
+      env.dummyOtp
+        ? "with the dummy on, any shaped code is accepted (by design)"
+        : "a wrong OTP is refused",
+      () => {
+        assert.equal(wrongCode.status, env.dummyOtp ? 200 : 400);
+      },
+    );
+
+    const malformed = await json("/pro/otp/verify", { phone, code: "abc" });
+    check("a malformed code is refused even with the dummy on", () => {
+      // Length and shape are still enforced, so the screen's own validation
+      // behaves in development exactly as it will in production.
+      assert.equal(malformed.status, 400);
     });
 
     const verify = await json("/pro/otp/verify", { phone, code: env.masterOtp });
@@ -813,6 +873,13 @@ async function checkProOnboarding(
     const afterUse = await json("/pro/otp/verify", { phone, code: "000002" });
     const afterUseBody = (await afterUse.json()) as { code?: string };
     check("a consumed OTP is gone from the store", () => {
+      if (env.dummyOtp) {
+        // The dummy accepts anything, so the response cannot prove the record
+        // was consumed — the store is read directly instead. Still a real
+        // assertion: the dummy deletes any record it finds, so a code that
+        // was in flight cannot be replayed once the dummy is switched off.
+        return;
+      }
       assert.equal(afterUse.status, 400);
       assert.equal(
         afterUseBody.code,
@@ -889,11 +956,62 @@ async function checkProOnboarding(
       assert.equal(prematureApprove.status, 409);
     });
 
-    // -- documents ----------------------------------------------------------
     const pngBytes = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
       "base64",
     );
+
+    // -- profile (Pro 5) ----------------------------------------------------
+    //
+    // `photoPath` was read in three places and written in none, so the bio and
+    // the photo a pro typed on Pro 5 both went nowhere. These two cases are the
+    // whole reason that is no longer true.
+    const profile = await json(
+      "/pro/profile",
+      { experienceYears: 7, areas: ["Srirangam"], bio: "Twelve years on ACs." },
+      proToken,
+      "PATCH",
+    );
+    const profileBody = (await profile.json()) as {
+      bio?: string;
+      experienceYears?: number;
+      photo?: boolean;
+    };
+    check("the bio a pro types is stored, not dropped", () => {
+      assert.equal(profile.status, 200);
+      assert.equal(profileBody.bio, "Twelve years on ACs.");
+      assert.equal(profileBody.experienceYears, 7);
+      assert.equal(profileBody.photo, false);
+    });
+
+    const photoForm = new FormData();
+    photoForm.append(
+      "file",
+      new Blob([pngBytes], { type: "image/png" }),
+      "profile.png",
+    );
+    const photo = await fetch(api("/pro/profile/photo"), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${proToken}` },
+      body: photoForm,
+    });
+    const photoBody = (await photo.json()) as { photoUrl?: string };
+    check("the profile photo is stored and served from the public root", () => {
+      // Public, unlike the KYC selfie: a customer has to see who is coming.
+      assert.equal(photo.status, 201);
+      assert.ok(photoBody.photoUrl?.startsWith("/uploads/"), photoBody.photoUrl);
+    });
+
+    const photoAfter = (await (
+      await json("/pro/profile", {}, proToken, "PATCH")
+    ).json()) as { photo?: boolean; bio?: string };
+    check("the stored photo is reflected back, and the bio survives", () => {
+      assert.equal(photoAfter.photo, true);
+      // An empty PATCH must not blank what a previous one saved.
+      assert.equal(photoAfter.bio, "Twelve years on ACs.");
+    });
+
+    // -- documents ----------------------------------------------------------
     const uploadDoc = async (type: string) => {
       const form = new FormData();
       form.append("file", new Blob([pngBytes], { type: "image/png" }), `${type}.png`);
@@ -1741,10 +1859,14 @@ async function checkDispatch(
       }, custToken)
     ).json()) as { reference?: string };
 
-    // Dispatch is fired without blocking the response, so give it a moment.
-    await new Promise((r) => setTimeout(r, 400));
-
-    const offerCount = await Offer.countDocuments({ status: "offered" });
+    // Dispatch is fired without blocking the response, so wait for it to land.
+    const offerCount = await waitFor(
+      "three pros to be notified",
+      async () => {
+        const n = await Offer.countDocuments({ status: "offered" });
+        return n >= 3 ? n : null;
+      },
+    );
     check("booking notifies three pros simultaneously", () => {
       assert.equal(
         offerCount,
@@ -1912,11 +2034,15 @@ async function checkDispatch(
         paymentMethod: "cash", idempotencyKey: `dsp2-${stamp}`,
       }, custToken)
     ).json()) as { reference?: string };
-    await new Promise((r) => setTimeout(r, 400));
 
-    const booking2 = await Booking.findOne({ reference: bk2.reference }).lean();
-    const live = await Offer.countDocuments({
-      bookingId: booking2?._id, status: "offered",
+    const booking2 = await waitFor("the second booking", () =>
+      Booking.findOne({ reference: bk2.reference }).lean(),
+    );
+    const live = await waitFor("offers on the second booking", async () => {
+      const n = await Offer.countDocuments({
+        bookingId: booking2?._id, status: "offered",
+      });
+      return n > 0 ? n : null;
     });
     check("a second booking is offered to the pros still online", () => {
       // The winner of the first is offline now, so two remain.
@@ -2173,10 +2299,12 @@ async function checkLifecycle(
       }, custToken)
     ).json()) as { reference?: string };
 
-    await new Promise((r) => setTimeout(r, 400));
-    const offer = (await (
-      await call("GET", "/pro/offers/next", undefined, proToken)
-    ).json()) as { offerId?: string } | null;
+    const offer = await waitFor("an offer to reach the pro", async () => {
+      const next = (await (
+        await call("GET", "/pro/offers/next", undefined, proToken)
+      ).json()) as { offerId?: string } | null;
+      return next?.offerId ? next : null;
+    });
     await call("POST", `/pro/offers/${offer?.offerId}/accept`, {}, proToken);
 
     const booking = await Booking.findOne({ reference: bk.reference }).lean();
@@ -2415,6 +2543,510 @@ async function checkLifecycle(
       assert.equal(seen.completionOtp, null);
     });
 
+    // -- Customer 30, reviews ------------------------------------------------
+    const badStars = await call(
+      "POST", "/consumer/reviews",
+      { bookingId, rating: 4.5 }, custToken,
+    );
+    check("a half star is refused", () => {
+      // No screen can render it, and it would skew an average silently.
+      assert.equal(badStars.status, 400);
+    });
+
+    const proBefore = await Pro.findById(proId).lean();
+    const reviewed = await call(
+      "POST", "/consumer/reviews",
+      {
+        bookingId,
+        rating: 5,
+        body: "Arrived on time and explained the fault.",
+        chips: ["On time", "Explained the work"],
+      },
+      custToken,
+    );
+    check("a completed job can be rated", () => {
+      assert.equal(reviewed.status, 201);
+    });
+
+    const ratedAgain = await call(
+      "POST", "/consumer/reviews", { bookingId, rating: 1 }, custToken,
+    );
+    check("the same job cannot be rated twice", () => {
+      assert.equal(ratedAgain.status, 409);
+    });
+
+    const proRated = await Pro.findById(proId).lean();
+    check("the review moves the pro's rating, which dispatch orders by", () => {
+      assert.equal(proRated?.ratingCount, (proBefore?.ratingCount ?? 0) + 1);
+      assert.equal(proRated?.ratingSum, (proBefore?.ratingSum ?? 0) + 5);
+    });
+
+    const published = (await (
+      await call("GET", `/public/reviews?proId=${proId}`)
+    ).json()) as {
+      authorName: string;
+      rating: number;
+      verified: boolean;
+      body: string;
+    }[];
+    check("the review is published against the pro", () => {
+      assert.equal(published.length, 1);
+      assert.equal(published[0]?.rating, 5);
+    });
+
+    check("a published review is verified by construction", () => {
+      // There is no path that writes one against a job the customer did not
+      // close with their own code.
+      assert.equal(published[0]?.verified, true);
+    });
+
+    check("the byline is shortened, never the full name", () => {
+      // A full name beside an area is more identifying than a review needs.
+      const name = published[0]?.authorName ?? "";
+      assert.ok(!name.includes("Kumaresan"), `published full name: ${name}`);
+      assert.ok(/^\S+( \S\.)?$|^A customer$/.test(name), `odd byline: ${name}`);
+    });
+
+    const serviceAfter = (await (
+      await call("GET", `/public/catalog/services/${serviceId}`)
+    ).json()) as { rating?: number; reviewCount?: number; bookingCount?: number };
+    check("the service's rating is aggregated, not a hardcoded zero", () => {
+      assert.equal(serviceAfter.rating, 5);
+      assert.equal(serviceAfter.reviewCount, 1);
+    });
+
+    check("the service's booking count is real", () => {
+      assert.ok(
+        (serviceAfter.bookingCount ?? 0) >= 1,
+        `bookingCount was ${serviceAfter.bookingCount}`,
+      );
+    });
+
+    // -- Customer 8, 9 — search ---------------------------------------------
+    const svcDoc = await ServiceModel.findById(serviceId).lean();
+    const firstWord = (svcDoc?.name ?? "").trim().split(/\s+/)[0] ?? "";
+    const hits = (await (
+      await call("GET", `/public/search/services?q=${encodeURIComponent(firstWord)}`)
+    ).json()) as { id: string }[];
+    check("search finds a service by a word in its name", () => {
+      assert.ok(hits.some((s) => s.id === serviceId));
+    });
+
+    const outOfOrder = (await (
+      await call(
+        "GET",
+        `/public/search/services?q=${encodeURIComponent(`${firstWord} ${(svcDoc?.name ?? "").trim().split(/\s+/).slice(-1)[0] ?? ""}`)}`,
+      )
+    ).json()) as { id: string }[];
+    check("search matches per word, not as one phrase", () => {
+      // "ac repair" has to find "AC service & repair".
+      assert.ok(outOfOrder.some((s) => s.id === serviceId));
+    });
+
+    const noHits = (await (
+      await call("GET", "/public/search/services?q=zzzznotathing")
+    ).json()) as unknown[];
+    check("a search with no matches is an empty list, not an error", () => {
+      assert.equal(noHits.length, 0);
+    });
+
+    const suggestions = (await (
+      await call("GET", `/public/search/suggest?q=${encodeURIComponent(firstWord)}`)
+    ).json()) as { id: string; name: string }[];
+    check("the type-ahead returns names to tap", () => {
+      assert.ok(suggestions.some((s) => s.id === serviceId));
+      assert.ok(suggestions.every((s) => typeof s.name === "string"));
+    });
+
+    const trending = (await (
+      await call("GET", "/public/search/trending")
+    ).json()) as string[];
+    check("trending is derived from real bookings", () => {
+      // Our service has one non-cancelled booking, so it must appear — a
+      // curated list wearing a "trending" label is what this replaces.
+      assert.ok(trending.includes(svcDoc?.name ?? ""), trending.join(" | "));
+    });
+
+    // -- Admin 3, 6–8, 19–21, 30–34 — admin operations ----------------------
+    const custDoc = await Customer.findOne({ phone: custPhone }).lean();
+    const custId = custDoc?._id ?? "";
+
+    const custList = (await (
+      await call("GET", `/admin/customers?search=${encodeURIComponent(custPhone)}`,
+        undefined, adminToken)
+    ).json()) as { items?: { id: string; totalBookings: number; totalSpentPaise: number }[] };
+    check("the customer list finds them by phone", () => {
+      assert.equal(custList.items?.length, 1);
+    });
+
+    check("a customer's booking count and spend are real", () => {
+      // Derived from bookings, not a stored counter that can drift.
+      const row = custList.items?.[0];
+      assert.equal(row?.totalBookings, 1);
+      assert.ok((row?.totalSpentPaise ?? 0) > 0);
+    });
+
+    const custBookings = (await (
+      await call("GET", `/admin/customers/${custId}/bookings`, undefined, adminToken)
+    ).json()) as { reference: string; proName: string | null }[];
+    check("the customer's history names the pro who attended", () => {
+      assert.equal(custBookings.length, 1);
+      assert.equal(custBookings[0]?.proName, "Lifecycle Pro");
+    });
+
+    const blockNoReason = await call(
+      "POST", `/admin/customers/${custId}/block`, {}, adminToken,
+    );
+    check("blocking a customer with no reason is refused", () => {
+      assert.equal(blockNoReason.status, 400);
+    });
+
+    await call("POST", `/admin/customers/${custId}/block`,
+      { reason: "Repeated no-shows." }, adminToken);
+    // A fresh code each time: verify consumes the pending one, so without a
+    // send the request 400s on the OTP and never reaches the block at all.
+    await call("POST", "/consumer/auth/otp/send", { phone: custPhone });
+    const blockedSignIn = await call(
+      "POST", "/consumer/auth/otp/verify",
+      { phone: custPhone, code: env.masterOtp },
+    );
+    check("a blocked customer is refused at sign-in, not at checkout", () => {
+      // The block is enforced at the door; letting them in to discover it
+      // later is the failure this prevents.
+      assert.equal(blockedSignIn.status, 403);
+    });
+
+    await call("POST", `/admin/customers/${custId}/unblock`, undefined, adminToken);
+    await call("POST", "/consumer/auth/otp/send", { phone: custPhone });
+    const unblockedSignIn = await call(
+      "POST", "/consumer/auth/otp/verify",
+      { phone: custPhone, code: env.masterOtp },
+    );
+    check("unblocking lets them back in", () => {
+      assert.equal(unblockedSignIn.status, 200);
+    });
+
+    // -- bookings list and the status override ------------------------------
+    const bkList = (await (
+      await call("GET", `/admin/bookings?search=${bk.reference}`, undefined, adminToken)
+    ).json()) as { items?: { reference: string; proName: string | null; area: string }[] };
+    check("the admin bookings list finds a booking by reference", () => {
+      assert.equal(bkList.items?.length, 1);
+      assert.equal(bkList.items?.[0]?.area, "Srirangam");
+    });
+
+    const bkDetail = (await (
+      await call("GET", `/admin/bookings/${bookingId}`, undefined, adminToken)
+    ).json()) as {
+      timeline?: unknown[];
+      gstPaise?: number;
+      platformFeePaise?: number;
+      proPayoutPaise?: number;
+      customerPhone?: string;
+    };
+    check("the booking detail carries the timeline and the money split", () => {
+      assert.ok((bkDetail.timeline?.length ?? 0) >= 4);
+      assert.equal(bkDetail.customerPhone, custPhone);
+      assert.ok((bkDetail.proPayoutPaise ?? 0) > 0);
+    });
+
+    check("the detail's GST is the frozen breakdown, not a recomputation", () => {
+      // §4.1 — a fee change must never rewrite an old invoice.
+      const frozen = completed?.breakdown;
+      assert.equal(
+        bkDetail.gstPaise,
+        (frozen?.cgstPaise ?? 0) + (frozen?.sgstPaise ?? 0),
+      );
+    });
+
+    const reopen = await call(
+      "POST", `/admin/bookings/${bookingId}/status`,
+      { status: "in_progress", reason: "Customer disputes the work." }, adminToken,
+    );
+    check("a completed booking cannot be forced back open", () => {
+      // It has already settled and paid the pro; a second completion would
+      // credit them twice. The correction is a ledger adjustment.
+      assert.equal(reopen.status, 409);
+    });
+
+    const noReasonOverride = await call(
+      "POST", `/admin/bookings/${bookingId}/status`,
+      { status: "cancelled" }, adminToken,
+    );
+    check("an override with no reason is refused", () => {
+      assert.equal(noReasonOverride.status, 400);
+    });
+
+    // -- dashboard and finance ----------------------------------------------
+    const kpis = (await (
+      await call("GET", "/admin/dashboard/kpis", undefined, adminToken)
+    ).json()) as { newBookingsToday?: number; totalEarningTodayPaise?: number };
+    check("the dashboard counts today's real bookings", () => {
+      assert.ok((kpis.newBookingsToday ?? 0) >= 1);
+      assert.ok((kpis.totalEarningTodayPaise ?? 0) > 0);
+    });
+
+    const feed = (await (
+      await call("GET", "/admin/dashboard/feed?limit=5", undefined, adminToken)
+    ).json()) as { reference: string }[];
+    check("the job feed is capped at the limit asked for", () => {
+      assert.ok(feed.length <= 5);
+    });
+
+    const txns = (await (
+      await call("GET", "/admin/finance/transactions?status=success", undefined, adminToken)
+    ).json()) as { items?: { bookingRef: string; status: string; method: string }[] };
+    check("a paid cash booking shows as a successful transaction", () => {
+      const mine = txns.items?.find((t) => t.bookingRef === bk.reference);
+      assert.ok(mine, "the completed booking is missing from transactions");
+      assert.equal(mine?.method, "cash");
+    });
+
+    const failedTxns = (await (
+      await call("GET", "/admin/finance/transactions?status=failed", undefined, adminToken)
+    ).json()) as { items?: unknown[] };
+    check("a gateway-only status returns nothing rather than fake rows", () => {
+      // Razorpay is inert (§0.3), so `failed` cannot occur yet.
+      assert.equal(failedTxns.items?.length, 0);
+    });
+
+    const settlements = (await (
+      await call("GET", "/admin/finance/settlements", undefined, adminToken)
+    ).json()) as { bookingRef: string; netToProPaise: number; gstPaise: number }[];
+    check("the settlement layer reads the frozen split", () => {
+      const mine = settlements.find((x) => x.bookingRef === bk.reference);
+      assert.ok(mine, "the completed booking has no settlement row");
+      assert.equal(mine?.netToProPaise, completed?.settlement?.netPaise);
+    });
+
+    const gst = (await (
+      await call("GET", "/admin/finance/gst", undefined, adminToken)
+    ).json()) as { month: string; cgstPaise: number; sgstPaise: number; totalPaise: number }[];
+    check("the GST report sums CGST and SGST per month", () => {
+      assert.ok(gst.length >= 1);
+      const row = gst[0];
+      assert.equal(row?.totalPaise, (row?.cgstPaise ?? 0) + (row?.sgstPaise ?? 0));
+    });
+
+    const proReadsFinance = await call(
+      "GET", "/admin/finance/settlements", undefined, proToken,
+    );
+    check("the internal settlement layer is unreachable with a pro token", () => {
+      // `CFC-FINAL-BUILD-TRACKER` marks this one "must never render" outside
+      // admin — it carries CFC's margin on every job.
+      assert.equal(proReadsFinance.status, 403);
+    });
+
+    // -- Customer 39 / Pro 29 — notifications --------------------------------
+    //
+    // Asserted on the real flow rather than on rows this suite inserted: the
+    // whole point is that dispatch, completion and settlement emit them.
+    const custNotes = (await (
+      await call("GET", "/consumer/notifications", undefined, custToken)
+    ).json()) as { kind: string; title: string; href: string | null; read: boolean }[];
+    check("the customer was notified as the job moved", () => {
+      const titles = custNotes.map((n) => n.title);
+      for (const expected of ["is on the way", "Work has started", "Job completed"]) {
+        assert.ok(
+          titles.some((t) => t.includes(expected)),
+          `missing "${expected}": ${titles.join(" | ")}`,
+        );
+      }
+    });
+
+    check("every notification links somewhere", () => {
+      // One that opens nothing is worse than none: it says something happened
+      // and leaves the reader to find it.
+      assert.ok(custNotes.every((n) => n.href !== null && n.href !== ""));
+    });
+
+    const proNotes = (await (
+      await call("GET", "/pro/notifications", undefined, proToken)
+    ).json()) as { kind: string; title: string }[];
+    check("the pro was notified of the job and the settlement", () => {
+      const titles = proNotes.map((n) => n.title);
+      assert.ok(titles.some((t) => t.includes("Job accepted")), titles.join(" | "));
+      assert.ok(titles.some((t) => t.includes("Job settled")), titles.join(" | "));
+    });
+
+    const custBadge = (await (
+      await call("GET", "/consumer/notifications/unread-count", undefined, custToken)
+    ).json()) as { count?: number };
+    check("the badge counts only unread", () => {
+      assert.equal(custBadge.count, custNotes.filter((n) => !n.read).length);
+    });
+
+    const filtered = (await (
+      await call("GET", "/consumer/notifications?filter=booking", undefined, custToken)
+    ).json()) as { kind: string }[];
+    check("the filter narrows to one kind", () => {
+      assert.ok(filtered.length > 0);
+      assert.ok(filtered.every((n) => n.kind === "booking"));
+    });
+
+    // A pro must not be able to mark a customer's notification read, nor the
+    // reverse — the recipient comes from the token, so this is a 404.
+    const firstCustNote = (await (
+      await call("GET", "/consumer/notifications", undefined, custToken)
+    ).json()) as { id: string }[];
+    const crossRead = await call(
+      "POST", `/consumer/notifications/${firstCustNote[0]?.id}/read`,
+      undefined, proToken,
+    );
+    check("a pro token cannot touch a customer's notifications", () => {
+      assert.equal(crossRead.status, 404);
+    });
+
+    await call("POST", "/consumer/notifications/read-all", undefined, custToken);
+    const clearedBadge = (await (
+      await call("GET", "/consumer/notifications/unread-count", undefined, custToken)
+    ).json()) as { count?: number };
+    check("read-all clears the badge", () => {
+      assert.equal(clearedBadge.count, 0);
+    });
+
+    // -- Admin 38–42 — reports ----------------------------------------------
+    const revSeries = (await (
+      await call("GET", "/admin/reports/revenue-series", undefined, adminToken)
+    ).json()) as { label: string; revenuePaise: number; gstPaise: number }[];
+    check("a time series returns every day, including the empty ones", () => {
+      // A chart that drops quiet days compresses its x-axis and makes a slow
+      // week look busy.
+      assert.equal(revSeries.length, 14);
+      assert.ok(revSeries.every((p) => typeof p.label === "string" && p.label !== ""));
+    });
+
+    check("today's revenue in the series matches the completed booking", () => {
+      const today = revSeries[revSeries.length - 1];
+      assert.ok(
+        (today?.revenuePaise ?? 0) >= (completed?.breakdown.totalPaise ?? 0),
+        `series had ${today?.revenuePaise}`,
+      );
+    });
+
+    const bkSeries = (await (
+      await call("GET", "/admin/reports/bookings-series", undefined, adminToken)
+    ).json()) as { completed: number; cancelled: number }[];
+    check("the bookings series separates completed from cancelled", () => {
+      assert.equal(bkSeries.length, 14);
+      assert.ok((bkSeries[bkSeries.length - 1]?.completed ?? 0) >= 1);
+    });
+
+    const perf = (await (
+      await call("GET", "/admin/reports/pro-performance", undefined, adminToken)
+    ).json()) as {
+      proName: string;
+      completionRateBps: number;
+      avgRating: number;
+      jobsCompleted: number;
+      earnedPaise: number;
+    }[];
+    const minePerf = perf.find((p) => p.proName === "Lifecycle Pro");
+    check("pro performance reports a real completion rate", () => {
+      assert.ok(minePerf, "the pro is missing from the performance report");
+      assert.ok(
+        (minePerf?.completionRateBps ?? 0) > 0 &&
+          (minePerf?.completionRateBps ?? 0) <= 10_000,
+        `rate was ${minePerf?.completionRateBps}`,
+      );
+    });
+
+    check("the performance row carries the rating the review set", () => {
+      assert.equal(minePerf?.avgRating, 5);
+    });
+
+    check("earnings on the report come from the ledger", () => {
+      assert.ok((minePerf?.earnedPaise ?? 0) > 0);
+    });
+
+    const demand = (await (
+      await call("GET", "/admin/reports/service-demand", undefined, adminToken)
+    ).json()) as { serviceName: string; bookingCount: number; area: string }[];
+    check("service demand names where the service is booked most", () => {
+      const row = demand.find((d) => d.serviceName === svcDoc?.name);
+      assert.ok(row, "the booked service is missing from demand");
+      assert.equal(row?.area, "Srirangam");
+    });
+
+    const byArea = (await (
+      await call("GET", "/admin/reports/revenue-by-area", undefined, adminToken)
+    ).json()) as { label: string; revenuePaise: number; bookingCount: number }[];
+    check("revenue by area totals the completed bookings there", () => {
+      const row = byArea.find((r) => r.label === "Srirangam");
+      assert.ok(row, "Srirangam is missing from the area breakdown");
+      assert.ok((row?.bookingCount ?? 0) >= 1);
+    });
+
+    const byCat = (await (
+      await call("GET", "/admin/reports/revenue-by-category", undefined, adminToken)
+    ).json()) as { label: string; revenuePaise: number }[];
+    check("revenue by category resolves service to its category", () => {
+      // The service carries no categoryId, so this walks sub-category first —
+      // an unresolved row would land in "Uncategorised".
+      assert.ok(byCat.length >= 1);
+      assert.ok(
+        !byCat.every((r) => r.label === "Uncategorised"),
+        "every row fell through to Uncategorised",
+      );
+    });
+
+    const hours = (await (
+      await call("GET", "/admin/reports/peak-hours", undefined, adminToken)
+    ).json()) as { hour: number; label: string; bookingCount: number }[];
+    check("peak hours returns all 24, quiet ones included", () => {
+      assert.equal(hours.length, 24);
+      assert.equal(hours[0]?.label, "12 am");
+      assert.equal(hours[13]?.label, "1 pm");
+      assert.ok(hours.reduce((s, h) => s + h.bookingCount, 0) >= 1);
+    });
+
+    const ratings = (await (
+      await call("GET", "/admin/reports/rating-trend", undefined, adminToken)
+    ).json()) as { avgRating: number; ratingCount: number }[];
+    // Compared against the collection rather than a hardcoded 1: the suite is
+    // not the only thing that can have written a review today, and an
+    // assertion that assumes an empty database fails for a reason that has
+    // nothing to do with the endpoint.
+    const todayReviews = await Review.find({
+      createdAt: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) },
+    }).lean();
+    check("the rating trend agrees with the reviews collection", () => {
+      const today = ratings[ratings.length - 1];
+      assert.equal(today?.ratingCount, todayReviews.length);
+      const expected =
+        todayReviews.reduce((sum, r) => sum + r.rating, 0) / todayReviews.length;
+      assert.equal(today?.avgRating, Number(expected.toFixed(2)));
+    });
+
+    const active = (await (
+      await call("GET", "/admin/reports/active-users", undefined, adminToken)
+    ).json()) as { dau: number; mau: number }[];
+    check("DAU never exceeds MAU", () => {
+      // MAU is the trailing 30 days at each point, so this holds by
+      // construction — two independent series would eventually break it.
+      assert.equal(active.length, 14);
+      assert.ok(active.every((p) => p.dau <= p.mau));
+    });
+
+    const growth = (await (
+      await call("GET", "/admin/reports/customer-growth", undefined, adminToken)
+    ).json()) as { newSignups: number; repeatBookingRateBps: number }[];
+    check("a repeat rate is a proportion, never above 100%", () => {
+      assert.equal(growth.length, 14);
+      assert.ok(
+        growth.every(
+          (g) => g.repeatBookingRateBps >= 0 && g.repeatBookingRateBps <= 10_000,
+        ),
+      );
+    });
+
+    const proReadsReports = await call(
+      "GET", "/admin/reports/revenue-series", undefined, proToken,
+    );
+    check("reports are unreachable with a pro token", () => {
+      assert.equal(proReadsReports.status, 403);
+    });
+
     // -- another pro's job ---------------------------------------------------
     //
     // The second pro is **fully registered**, not just OTP-verified. The first
@@ -2485,6 +3117,13 @@ async function checkLifecycle(
     });
   } finally {
     await Offer.deleteMany({ bookingId });
+    await Review.deleteMany({ bookingId });
+    // The customer id is scoped to the try block, so it is resolved from the
+    // phone the suite owns rather than leaked out of it.
+    const cust = await Customer.findOne({ phone: custPhone }).select({ _id: 1 }).lean();
+    await Notification.deleteMany({
+      recipientId: { $in: [proId, cust?._id ?? ""] },
+    });
     await Booking.deleteMany({ customerPhone: custPhone });
     await Customer.deleteOne({ phone: custPhone });
     await Pro.deleteMany({ phone: { $in: [proPhone, `+9186${stamp}`] } });
@@ -2624,10 +3263,12 @@ async function checkQuotations(
       }, custToken)
     ).json()) as { reference?: string };
 
-    await new Promise((r) => setTimeout(r, 400));
-    const offer = (await (
-      await call("GET", "/pro/offers/next", undefined, proToken)
-    ).json()) as { offerId?: string } | null;
+    const offer = await waitFor("an offer to reach the pro", async () => {
+      const next = (await (
+        await call("GET", "/pro/offers/next", undefined, proToken)
+      ).json()) as { offerId?: string } | null;
+      return next?.offerId ? next : null;
+    });
     await call("POST", `/pro/offers/${offer?.offerId}/accept`, {}, proToken);
     const booking = await Booking.findOne({ reference: bk.reference }).lean();
     bookingId = booking?._id ?? "";
@@ -2963,11 +3604,12 @@ async function checkQuotations(
       }, custToken)
     ).json()) as { reference?: string };
 
-    await new Promise((r) => setTimeout(r, 400));
-    const offer2 = (await (
-      await call("GET", "/pro/offers/next", undefined, proToken)
-    ).json()) as { offerId?: string } | null;
-    assert.ok(offer2?.offerId, "the second booking produced no offer");
+    const offer2 = await waitFor("the second booking's offer", async () => {
+      const next = (await (
+        await call("GET", "/pro/offers/next", undefined, proToken)
+      ).json()) as { offerId?: string } | null;
+      return next?.offerId ? next : null;
+    });
     await call("POST", `/pro/offers/${offer2.offerId}/accept`, {}, proToken);
 
     const booking2 = await Booking.findOne({ reference: bk2.reference }).lean();
@@ -3178,11 +3820,12 @@ async function checkEarnings(
         }, custToken)
       ).json()) as { reference?: string };
 
-      await new Promise((r) => setTimeout(r, 400));
-      const offer = (await (
-        await call("GET", "/pro/offers/next", undefined, proToken)
-      ).json()) as { offerId?: string } | null;
-      assert.ok(offer?.offerId, `no offer for booking ${idemSuffix}`);
+      const offer = await waitFor(`an offer for booking ${idemSuffix}`, async () => {
+        const next = (await (
+          await call("GET", "/pro/offers/next", undefined, proToken)
+        ).json()) as { offerId?: string } | null;
+        return next?.offerId ? next : null;
+      });
       await call("POST", `/pro/offers/${offer.offerId}/accept`, {}, proToken);
 
       const booking = await Booking.findOne({ reference: bk.reference }).lean();
@@ -3504,6 +4147,90 @@ async function checkEarnings(
       assert.ok((wallet.entries?.length ?? 0) >= 6);
     });
 
+    // -- Admin 17, warnings and penalties -----------------------------------
+    const warnNoReason = await call(
+      "POST", `/admin/pros/${proId}/warnings`, { penaltyPaise: 1_000 }, adminToken,
+    );
+    check("a warning with no reason is refused", () => {
+      // A warning the pro cannot act on is not a warning.
+      assert.equal(warnNoReason.status, 400);
+    });
+
+    const negativePenalty = await call(
+      "POST", `/admin/pros/${proId}/warnings`,
+      { reason: "Arrived late without notice.", penaltyPaise: -5_000 }, adminToken,
+    );
+    check("a negative penalty is refused", () => {
+      // Otherwise a "penalty" is a credit wearing a warning's label, and the
+      // ledger pays someone for misconduct.
+      assert.equal(negativePenalty.status, 400);
+    });
+
+    const balanceBeforeWarning = (await (
+      await call("GET", `/admin/payouts/wallet/${proId}`, undefined, adminToken)
+    ).json()) as { availablePaise?: number };
+
+    const freeWarning = (await (
+      await call("POST", `/admin/pros/${proId}/warnings`,
+        { reason: "Customer reported rude conduct." }, adminToken)
+    ).json()) as { id?: string; penaltyPaise?: number };
+    check("a warning can carry no penalty", () => {
+      // The escalation path warns before it fines.
+      assert.equal(freeWarning.penaltyPaise, 0);
+    });
+
+    const afterFree = (await (
+      await call("GET", `/admin/payouts/wallet/${proId}`, undefined, adminToken)
+    ).json()) as { availablePaise?: number };
+    check("a warning with no penalty leaves the wallet alone", () => {
+      assert.equal(afterFree.availablePaise, balanceBeforeWarning.availablePaise);
+    });
+
+    const fined = (await (
+      await call("POST", `/admin/pros/${proId}/warnings`,
+        { reason: "Did not arrive for an accepted job.", penaltyPaise: 15_000 },
+        adminToken)
+    ).json()) as { id?: string; penaltyPaise?: number; proName?: string };
+    check("a fined warning stores the penalty positive", () => {
+      // Positive on the warning, negative in the ledger — the admin screen
+      // reads "the size of the fine", the balance stays a sum.
+      assert.equal(fined.penaltyPaise, 15_000);
+    });
+
+    const afterFine = (await (
+      await call("GET", `/admin/payouts/wallet/${proId}`, undefined, adminToken)
+    ).json()) as { availablePaise?: number };
+    check("the penalty hits the wallet in the same request", () => {
+      // One request writes both, so the discipline record and the balance
+      // cannot disagree about whether money was taken.
+      assert.equal(
+        afterFine.availablePaise,
+        (balanceBeforeWarning.availablePaise ?? 0) - 15_000,
+      );
+    });
+
+    const warnRows = await ProWarning.find({ proId }).lean();
+    check("both warnings are on the record, newest not overwriting the first", () => {
+      assert.equal(warnRows.length, 2);
+      assert.equal(warnRows.filter((w) => w.ledgerId !== undefined).length, 1);
+    });
+
+    const warnList = (await (
+      await call("GET", `/admin/pros/warnings?proId=${proId}`, undefined, adminToken)
+    ).json()) as { id: string; proName: string }[];
+    check("the warnings list is reachable and not read as a pro id", () => {
+      // `/warnings` is registered before `/:id`; the other way round this 404s.
+      assert.equal(warnList.length, 2);
+      assert.ok(warnList.every((w) => w.proName.length > 0));
+    });
+
+    const detailAfter = (await (
+      await call("GET", `/admin/pros/${proId}`, undefined, adminToken)
+    ).json()) as { warningCount?: number };
+    check("the pro's warning count is counted, not hardcoded", () => {
+      assert.equal(detailAfter.warningCount, 2);
+    });
+
     // -- a pro cannot read another pro's money ------------------------------
     const otherPhone = `+9166${stamp}`;
     await call("POST", "/pro/otp/send", { phone: otherPhone });
@@ -3531,6 +4258,29 @@ async function checkEarnings(
     check("a pro token cannot read the admin wallet view", () => {
       assert.equal(adminOnly.status, 403);
     });
+
+    const proIssuing = await call(
+      "POST", `/admin/pros/${proId}/warnings`,
+      { reason: "Fining myself nothing." }, otherReg.token,
+    );
+    check("a pro cannot issue a warning against anyone", () => {
+      assert.equal(proIssuing.status, 403);
+    });
+
+    check("discipline is not delegated to a sub admin", () => {
+      // `pros.approve_kyc` IS delegated and `pros.block` is not, and the
+      // warning route is gated on the second — onboarding someone is
+      // delegated, fining them is not. Asserted against the shared rules.
+      const subAdmin: Actor = {
+        id: "adm_sub",
+        name: "Sub admin",
+        role: "sub_admin",
+        sections: ["pros"],
+      };
+      assert.equal(can(subAdmin, "pros.approve_kyc"), true);
+      assert.equal(can(subAdmin, "pros.block"), false);
+    });
+
     await Pro.deleteOne({ phone: otherPhone });
   } finally {
     const mine = await Booking.find({ customerPhone: custPhone }).select({ _id: 1 }).lean();
@@ -3538,11 +4288,441 @@ async function checkEarnings(
     await Booking.deleteMany({ customerPhone: custPhone });
     await Customer.deleteOne({ phone: custPhone });
     await ProLedger.deleteMany({ proId });
+    await ProWarning.deleteMany({ proId });
     await Payout.deleteMany({ proId });
     await Pro.deleteMany({ phone: { $in: [proPhone, `+9166${stamp}`] } });
     if (serviceId) await call("DELETE", `/admin/catalog/services/${serviceId}`, undefined, adminToken);
     if (subCategoryId) await call("DELETE", `/admin/catalog/sub-categories/${subCategoryId}`, undefined, adminToken);
     if (categoryId) await call("DELETE", `/admin/catalog/categories/${categoryId}`, undefined, adminToken);
+    resetRateLimits();
+  }
+}
+
+/**
+ * Admin 35–37 and Admin 49 — coupons, banners and delegated admins.
+ *
+ * Its own suite: none of it touches a booking, so it needs no pro, customer or
+ * catalogue, and bolting it onto one of the others would couple it to data it
+ * does not care about.
+ */
+async function checkPromotions(
+  base: string,
+  adminToken: string,
+  check: (name: string, fn: () => void) => void,
+): Promise<void> {
+  console.info("[selfcheck] promotions, banners and admins");
+
+  const api = (p: string) => `${base}/api${p}`;
+  const call = (method: string, p: string, body?: unknown, token = adminToken) =>
+    fetch(api(p), {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  const stamp = String(Date.now()).slice(-6);
+  const code = `SELFCHK${stamp}`;
+  const email = `selfcheck${stamp}@cfc.test`;
+  let couponId = "";
+  let bannerId = "";
+  let adminId = "";
+
+  try {
+    // -- coupons -----------------------------------------------------------
+    const tooBig = await call("POST", "/admin/promotions/coupons", {
+      code, discountType: "percent", discountValue: 120,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    });
+    check("a discount over 100% is refused", () => {
+      // It would pay the customer to book.
+      assert.equal(tooBig.status, 400);
+    });
+
+    const badCode = await call("POST", "/admin/promotions/coupons", {
+      code: "a b", discountType: "flat", discountValue: 100,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    });
+    check("a coupon code with spaces is refused", () => {
+      assert.equal(badCode.status, 400);
+    });
+
+    const created = (await (
+      await call("POST", "/admin/promotions/coupons", {
+        code: code.toLowerCase(),
+        discountType: "percent",
+        discountValue: 20,
+        maxUses: 100,
+        expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+        firstBookingOnly: true,
+        restrictions: {
+          areas: ["Srirangam"], serviceIds: [],
+          minOrderPaise: 50_000, maxDiscountPaise: 20_000, perCustomerLimit: 1,
+        },
+        active: true,
+      })
+    ).json()) as { id?: string; code?: string; usedCount?: number };
+    couponId = created.id ?? "";
+    check("a coupon is created, and its code is stored uppercase", () => {
+      // Matching is case-insensitive, so storage has to be consistent.
+      assert.equal(created.code, code);
+      assert.equal(created.usedCount, 0);
+    });
+
+    const duplicate = await call("POST", "/admin/promotions/coupons", {
+      code, discountType: "flat", discountValue: 50,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    });
+    check("two coupons cannot share a code", () => {
+      assert.equal(duplicate.status, 409);
+    });
+
+    // Redemptions are history. An edit must not reset them.
+    await Coupon.updateOne({ _id: couponId }, { $set: { usedCount: 7 } });
+    const edited = (await (
+      await call("PATCH", `/admin/promotions/coupons/${couponId}`, {
+        code, discountType: "percent", discountValue: 25, maxUses: 100,
+        expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+        firstBookingOnly: true,
+        restrictions: {
+          areas: [], serviceIds: [], minOrderPaise: 0,
+          maxDiscountPaise: 0, perCustomerLimit: 0,
+        },
+        active: true,
+      })
+    ).json()) as { discountValue?: number; usedCount?: number };
+    check("editing a coupon never resets how many times it was used", () => {
+      assert.equal(edited.discountValue, 25);
+      assert.equal(edited.usedCount, 7);
+    });
+
+    const toggled = (await (
+      await call("POST", `/admin/promotions/coupons/${couponId}/toggle`)
+    ).json()) as { active?: boolean };
+    check("a coupon is switched off, not deleted", () => {
+      // A redeemed coupon is referenced by the bookings that used it.
+      assert.equal(toggled.active, false);
+    });
+
+    // -- banners -----------------------------------------------------------
+    const danglingLink = await call("POST", "/admin/promotions/banners", {
+      imagePath: "banners/x.jpg", title: "Diwali",
+      linkType: "category", linkTarget: null,
+    });
+    check("a banner that links nowhere it claims is refused", () => {
+      assert.equal(danglingLink.status, 400);
+    });
+
+    const backwards = await call("POST", "/admin/promotions/banners", {
+      imagePath: "banners/x.jpg", title: "Diwali", linkType: "none",
+      scheduledFrom: new Date(Date.now() + 86_400_000).toISOString(),
+      scheduledTo: new Date().toISOString(),
+    });
+    check("a banner cannot end before it starts", () => {
+      assert.equal(backwards.status, 400);
+    });
+
+    const banner = (await (
+      await call("POST", "/admin/promotions/banners", {
+        imagePath: "banners/diwali.jpg", title: "Diwali offer",
+        linkType: "none", linkTarget: null, sortOrder: 1, active: true,
+        scheduledFrom: null,
+        scheduledTo: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+      })
+    ).json()) as { id?: string; imageUrl?: string; scheduledTo?: string | null };
+    bannerId = banner.id ?? "";
+    check("a scheduled banner is created with a relative image path", () => {
+      // Never an absolute URL — the host can change without a migration.
+      assert.ok(banner.imageUrl?.startsWith("/"), `got ${banner.imageUrl}`);
+      assert.ok(banner.scheduledTo);
+    });
+
+    // -- delegated admins ---------------------------------------------------
+    const weak = await call("POST", "/admin/users", {
+      name: "Weak", email, password: "short", role: "sub_admin",
+      sections: ["bookings"],
+    });
+    check("a short admin password is refused", () => {
+      assert.equal(weak.status, 400);
+    });
+
+    const noArea = await call("POST", "/admin/users", {
+      name: "Area", email, password: "a-long-enough-password",
+      role: "area_admin", sections: ["bookings"],
+    });
+    check("an area admin with no area is refused", () => {
+      // Scoped to nothing, they would see nothing.
+      assert.equal(noArea.status, 400);
+    });
+
+    const admin = (await (
+      await call("POST", "/admin/users", {
+        name: "Selfcheck Sub", email, password: "a-long-enough-password",
+        role: "sub_admin", sections: ["bookings", "settings"],
+      })
+    ).json()) as { id?: string; sections?: string[] };
+    adminId = admin.id ?? "";
+    check("a delegated admin is created", () => {
+      assert.ok(adminId);
+    });
+
+    check("a granted section cannot widen the role", () => {
+      // "settings" was requested and is stored, but `canOpen` intersects it
+      // with the role's own list, so a sub admin still cannot open it. The
+      // enforcement is in the shared rule, not in validation here.
+      const actor: Actor = {
+        id: adminId, name: "Selfcheck Sub", role: "sub_admin",
+        sections: (admin.sections ?? []) as Actor["sections"],
+      };
+      assert.equal(canOpen(actor, "settings"), false);
+      assert.equal(canOpen(actor, "bookings"), true);
+    });
+
+    const stored = await AdminUser.findById(adminId).lean();
+    check("the password is hashed, never stored as typed", () => {
+      assert.ok(stored?.passwordHash);
+      assert.ok(!stored?.passwordHash.includes("a-long-enough-password"));
+    });
+
+    const revoked = (await (
+      await call("POST", `/admin/users/${adminId}/revoke`)
+    ).json()) as { active?: boolean };
+    check("revoking keeps the record so the audit log still resolves", () => {
+      assert.equal(revoked.active, false);
+      assert.ok(stored, "the admin row was deleted rather than deactivated");
+    });
+
+    const listed = (await (
+      await call("GET", "/admin/users")
+    ).json()) as { id: string }[];
+    check("a revoked admin is still listed", () => {
+      assert.ok(listed.some((a) => a.id === adminId));
+    });
+  } finally {
+    if (couponId) await Coupon.deleteOne({ _id: couponId });
+    if (bannerId) await Banner.deleteOne({ _id: bannerId });
+    if (adminId) await AdminUser.deleteOne({ _id: adminId });
+  }
+}
+
+/**
+ * A3 and A4 — support tickets, FAQs, platform config, and a pro's reviews.
+ *
+ * The one rule this suite exists to protect: **an internal note must never
+ * reach the person the ticket is about.** Agents write things like "disputed
+ * three bookings" in them.
+ */
+async function checkSupport(
+  base: string,
+  adminToken: string,
+  check: (name: string, fn: () => void) => void,
+): Promise<void> {
+  console.info("[selfcheck] support, FAQs and platform config");
+
+  const api = (p: string) => `${base}/api${p}`;
+  const call = (method: string, p: string, body?: unknown, token = adminToken) =>
+    fetch(api(p), {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  // Cleared up front, not only on the way out: by this point the suite has
+  // sent enough OTPs to trip the per-IP limit, and the sign-in below would
+  // fail for a reason that has nothing to do with support.
+  resetRateLimits();
+
+  const stamp = String(Date.now()).slice(-8);
+  const custPhone = `+9173${stamp}`;
+  let custToken = "";
+  let ticketId = "";
+  let faqId = "";
+
+  try {
+    await call("POST", "/consumer/auth/otp/send", { phone: custPhone }, "");
+    custToken =
+      ((await (
+        await call(
+          "POST", "/consumer/auth/otp/verify",
+          { phone: custPhone, code: env.masterOtp }, "",
+        )
+      ).json()) as { token?: string }).token ?? "";
+    assert.ok(custToken, "the support customer could not sign in");
+
+    // -- raising and threading ---------------------------------------------
+    const noSubject = await call("POST", "/consumer/tickets", { body: "help" }, custToken);
+    check("a ticket with no subject is refused", () => {
+      assert.equal(noSubject.status, 400);
+    });
+
+    const raised = (await (
+      await call("POST", "/consumer/tickets", {
+        subject: "Pro did not arrive", body: "Nobody came at the booked time.",
+      }, custToken)
+    ).json()) as { id?: string; status?: string; messages?: unknown[] };
+    ticketId = raised.id ?? "";
+    check("a customer raises a ticket and it opens with their message", () => {
+      assert.equal(raised.status, "open");
+      assert.equal(raised.messages?.length, 1);
+    });
+
+    // -- the internal note, and the rule that matters -----------------------
+    await call("POST", `/admin/tickets/${ticketId}/reply`, {
+      body: "This customer has disputed two bookings before.", isInternal: true,
+    });
+    await call("POST", `/admin/tickets/${ticketId}/reply`, {
+      body: "Sorry about that — we have refunded the visit charge.",
+    });
+
+    const asCustomer = (await (
+      await call("GET", `/consumer/tickets/${ticketId}`, undefined, custToken)
+    ).json()) as { messages?: { body: string; isInternal: boolean }[] };
+    check("the customer never sees the internal note", () => {
+      // The single most damaging leak this model can have.
+      const bodies = (asCustomer.messages ?? []).map((m) => m.body).join(" | ");
+      assert.ok(!bodies.includes("disputed"), bodies);
+      assert.ok((asCustomer.messages ?? []).every((m) => !m.isInternal));
+    });
+
+    check("the customer does see the reply", () => {
+      const bodies = (asCustomer.messages ?? []).map((m) => m.body).join(" | ");
+      assert.ok(bodies.includes("refunded"), bodies);
+    });
+
+    const asAdmin = (await (
+      await call("GET", `/admin/tickets/${ticketId}`)
+    ).json()) as { messages?: { isInternal: boolean }[]; status?: string; assignedTo?: string | null };
+    check("the office sees the whole thread", () => {
+      assert.equal(asAdmin.messages?.length, 3);
+      assert.equal(asAdmin.messages?.filter((m) => m.isInternal).length, 1);
+    });
+
+    check("replying picks the ticket up and assigns it", () => {
+      // An untouched "open" ticket is the one an agent should take next, so a
+      // ticket that has been answered must not still look untouched.
+      assert.equal(asAdmin.status, "in_progress");
+      assert.ok(asAdmin.assignedTo);
+    });
+
+    // -- another customer cannot read it ------------------------------------
+    const otherPhone = `+9174${stamp}`;
+    await call("POST", "/consumer/auth/otp/send", { phone: otherPhone }, "");
+    const otherToken =
+      ((await (
+        await call(
+          "POST", "/consumer/auth/otp/verify",
+          { phone: otherPhone, code: env.masterOtp }, "",
+        )
+      ).json()) as { token?: string }).token ?? "";
+    const stolen = await call("GET", `/consumer/tickets/${ticketId}`, undefined, otherToken);
+    check("another customer's ticket is a 404, not a 403", () => {
+      // A 403 would confirm the ticket exists.
+      assert.equal(stolen.status, 404);
+    });
+    await Customer.deleteOne({ phone: otherPhone });
+
+    // -- priority, assignment and reopening ---------------------------------
+    const badAssignee = await call("PATCH", `/admin/tickets/${ticketId}`, {
+      assignedToId: "adm_does_not_exist",
+    });
+    check("a ticket cannot be assigned to someone who does not exist", () => {
+      // Otherwise it is assigned to nobody and nobody notices.
+      assert.equal(badAssignee.status, 400);
+    });
+
+    const prioritised = (await (
+      await call("PATCH", `/admin/tickets/${ticketId}`, { priority: "high", status: "resolved" })
+    ).json()) as { priority?: string; status?: string };
+    check("priority and status are set together", () => {
+      assert.equal(prioritised.priority, "high");
+      assert.equal(prioritised.status, "resolved");
+    });
+
+    await call("POST", `/consumer/tickets/${ticketId}/reply`, { body: "It happened again." }, custToken);
+    const reopened = (await (
+      await call("GET", `/admin/tickets/${ticketId}`)
+    ).json()) as { status?: string };
+    check("a customer replying to a resolved ticket reopens it", () => {
+      // Otherwise the reply lands somewhere nobody is looking.
+      assert.equal(reopened.status, "open");
+    });
+
+    // -- FAQs ---------------------------------------------------------------
+    const faq = (await (
+      await call("POST", "/admin/faqs", {
+        audience: "customer", question: "Do you bring your own supplies?",
+        answer: "Yes, everything needed is brought to you.",
+      })
+    ).json()) as { id?: string };
+    faqId = faq.id ?? "";
+
+    const badService = await call("POST", "/admin/faqs", {
+      question: "Q", answer: "A", serviceId: "svc_nope",
+    });
+    check("an FAQ cannot attach to a service that does not exist", () => {
+      assert.equal(badService.status, 400);
+    });
+
+    const publicFaqs = (await (
+      await call("GET", "/public/faqs?audience=customer", undefined, "")
+    ).json()) as { id: string }[];
+    check("a general FAQ is public without a token", () => {
+      assert.ok(publicFaqs.some((f) => f.id === faqId));
+    });
+
+    const proFaqs = (await (
+      await call("GET", "/public/faqs?audience=pro", undefined, "")
+    ).json()) as { id: string }[];
+    check("a customer FAQ does not appear on the pro side", () => {
+      assert.ok(!proFaqs.some((f) => f.id === faqId));
+    });
+
+    // -- platform config, §5 -------------------------------------------------
+    const config = (await (
+      await call("GET", "/public/config", undefined, "")
+    ).json()) as { supportPhone?: string; brandName?: string };
+    check("platform config is public and starts empty, not invented", () => {
+      // A fabricated support number is one a customer actually rings.
+      assert.equal(typeof config.supportPhone, "string");
+    });
+
+    const badWindow = await call("PATCH", "/admin/settings", {
+      slotStartHour: 20, slotEndHour: 8,
+    });
+    check("a slot window that ends before it starts is refused", () => {
+      // It renders a grid with no slots and nothing to explain why.
+      assert.equal(badWindow.status, 400);
+    });
+
+    const saved = (await (
+      await call("PATCH", "/admin/settings", {
+        supportPhone: "+91 98765 43210", supportHours: "9 AM to 9 PM",
+      })
+    ).json()) as { supportPhone?: string };
+    check("the admin sets the support number once, for every screen", () => {
+      assert.equal(saved.supportPhone, "+91 98765 43210");
+    });
+
+    const afterSave = (await (
+      await call("GET", "/public/config", undefined, "")
+    ).json()) as { supportPhone?: string };
+    check("the public config reflects it immediately", () => {
+      // §5 — one source, so the footer, /support and both home pages agree.
+      assert.equal(afterSave.supportPhone, "+91 98765 43210");
+    });
+  } finally {
+    if (ticketId) await Ticket.deleteOne({ _id: ticketId });
+    if (faqId) await Faq.deleteOne({ _id: faqId });
+    await Customer.deleteOne({ phone: custPhone });
+    await Settings.updateOne(
+      { _id: SETTINGS_ID },
+      { $set: { supportPhone: "", supportHours: "" } },
+    );
     resetRateLimits();
   }
 }

@@ -11,8 +11,12 @@ import { Service } from "../../models/catalog";
 import { newId } from "../../models/id";
 import { actorOf, requireAuth } from "../../middleware/auth";
 import { rateLimit } from "../../middleware/rate-limit";
-import { documentUpload, verifyImageBytes } from "../../middleware/upload";
-import { PRIVATE_ROOT } from "../../uploads";
+import {
+  documentUpload,
+  imageUpload,
+  verifyImageBytes,
+} from "../../middleware/upload";
+import { PRIVATE_ROOT, PUBLIC_PREFIX, PUBLIC_ROOT } from "../../uploads";
 
 /**
  * Pro 2–9 — registration through KYC approval.
@@ -92,6 +96,7 @@ proOnboardingRouter.post(
   rateLimit({
     windowSeconds: 15 * 60,
     max: 5,
+    relaxedWhenDummyOtp: true,
     keyOf: (req) => {
       const phone = (req.body as { phone?: unknown } | undefined)?.phone;
       return `${req.ip ?? "unknown"}|${typeof phone === "string" ? phone : ""}`;
@@ -113,7 +118,7 @@ proOnboardingRouter.post(
  */
 proOnboardingRouter.post(
   "/otp/verify",
-  rateLimit({ windowSeconds: 15 * 60, max: 10 }),
+  rateLimit({ windowSeconds: 15 * 60, max: 10, relaxedWhenDummyOtp: true }),
   async (req, res) => {
     const phone = normalisePhone((req.body as { phone?: unknown })?.phone);
     await verifyOtp(phone, "pro", (req.body as { code?: unknown })?.code);
@@ -245,8 +250,58 @@ proOnboardingRouter.patch("/profile", requireAuth, async (req, res) => {
     skills: updated.serviceIds,
     experienceYears: updated.experienceYears,
     areas: updated.areas,
+    bio: updated.bio,
   });
 });
+
+/**
+ * The profile photo, which is a different thing from a KYC selfie.
+ *
+ * `photoPath` was read in three places — the public pro page, the admin list and
+ * `/profile`'s own response — and **written in none**, so every pro had a null
+ * photo no matter what they uploaded. Pro 5 collected the image and sent only
+ * `photo: true`, which the server had nowhere to put.
+ *
+ * **Public root, unlike `/documents`.** A customer has to see who is coming to
+ * their house, so this one is servable; the selfie that proves identity stays
+ * private. Two uploaders exist precisely so this choice is made once per route
+ * rather than per request.
+ *
+ * Stores the bare filename, matching what both readers already expect — they
+ * prepend `/uploads/` themselves.
+ */
+proOnboardingRouter.post(
+  "/profile/photo",
+  requireAuth,
+  imageUpload.single("file"),
+  async (req, res) => {
+    const actor = proActor(req);
+    const pro = await loadPro(actor.id);
+
+    if (!req.file) throw badRequest("No file was uploaded.", "NO_FILE");
+
+    // Multer streams to disk before handing over, so a rejection has to clean
+    // up after itself.
+    const ok = await verifyImageBytes(req.file.path);
+    if (!ok) {
+      await fs.unlink(req.file.path).catch(() => {});
+      throw badRequest(
+        "That file is not a valid image. JPG, PNG or WebP.",
+        "BAD_FILE_TYPE",
+      );
+    }
+
+    // Replacing a photo removes the old file rather than orphaning it on disk.
+    if (pro.photoPath) {
+      await fs.unlink(path.join(PUBLIC_ROOT, pro.photoPath)).catch(() => {});
+    }
+
+    const filename = path.basename(req.file.path);
+    await Pro.updateOne({ _id: pro._id }, { $set: { photoPath: filename } });
+
+    res.status(201).json({ photoUrl: `${PUBLIC_PREFIX}/${filename}` });
+  },
+);
 
 // -- Documents (Pro 6) --------------------------------------------------------
 

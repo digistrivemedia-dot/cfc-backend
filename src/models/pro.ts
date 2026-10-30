@@ -66,6 +66,29 @@ export interface ProDoc {
   serviceIds: string[];
 
   /**
+   * Services the pro has switched **off** for now. Pro 28.
+   *
+   * Stored as the exceptions rather than the enabled set, so a service the
+   * admin adds to their registration is on by default — the alternative
+   * silently withholds new work until the pro notices a toggle they were
+   * never told about.
+   */
+  disabledServiceIds?: string[];
+
+  /**
+   * The pro's week, and holiday mode. Pro 29.
+   *
+   * Holiday mode is separate from setting all seven days off, deliberately: a
+   * pro going away for a week should not have to clear their schedule and
+   * rebuild it from memory when they return.
+   */
+  availability?: {
+    days: { day: string; working: boolean; from: string; to: string }[];
+    holidayMode: boolean;
+    holidayUntil: Date | null;
+  };
+
+  /**
    * Every area this pro will travel to.
    *
    * An **array**, which `ProListItem.area` in `@cfc/types` is not — the
@@ -144,6 +167,31 @@ const proSchema = new Schema<ProDoc>(
     phone: { type: String, required: true, unique: true },
     name: { type: String, required: true, trim: true },
     serviceIds: { type: [String], default: [] },
+    disabledServiceIds: { type: [String], default: [] },
+    availability: {
+      type: new Schema(
+        {
+          days: {
+            type: [
+              new Schema(
+                {
+                  day: { type: String, required: true },
+                  working: { type: Boolean, default: true },
+                  from: { type: String, default: "09:00" },
+                  to: { type: String, default: "18:00" },
+                },
+                { _id: false },
+              ),
+            ],
+            default: [],
+          },
+          holidayMode: { type: Boolean, default: false },
+          holidayUntil: { type: Date, default: null },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
     areas: { type: [String], default: [] },
     bio: { type: String, default: "", trim: true },
     experienceYears: { type: Number, default: 0 },

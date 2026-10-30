@@ -1,5 +1,11 @@
 import { Router } from "express";
-import type { DocumentType, Page, ProDetail, ProListItem } from "@cfc/types";
+import type {
+  DocumentType,
+  Page,
+  ProDetail,
+  ProListItem,
+  ProWarning as TypedProWarning,
+} from "@cfc/types";
 import { badRequest, conflict, notFound } from "../../error";
 import {
   actorOf,
@@ -11,6 +17,10 @@ import {
 import { Pro, canReceiveOffers, ratingOf, type ProDoc } from "../../models/pro";
 import { Service } from "../../models/catalog";
 import { audit } from "../../models/audit";
+import { notify } from "../../models/notification";
+import { ProWarning, type ProWarningDoc } from "../../models/pro-warning";
+import { ProLedger } from "../../models/pro-ledger";
+import { newId } from "../../models/id";
 import { param } from "../../params";
 import { PRIVATE_ROOT, resolveWithin } from "../../uploads";
 
@@ -132,6 +142,137 @@ adminProsRouter.get("/", async (req, res) => {
 });
 
 /**
+ * Admin 17 — the discipline record, across every pro or filtered to one.
+ *
+ * **Registered before `/:id` on purpose.** Express matches in order, so with
+ * these the other way round a request for `/warnings` is read as a request for
+ * the pro whose id is "warnings" and answers 404.
+ */
+adminProsRouter.get("/warnings", async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const filter: Record<string, unknown> = {};
+  if (typeof q["proId"] === "string") filter["proId"] = q["proId"];
+
+  // Area admins see their own area's pros only — the same scoping the list
+  // above applies, because a discipline record is no less area-scoped than the
+  // pro it belongs to.
+  const area = scopeArea(req);
+  if (area) {
+    const ids = await Pro.find({ areas: area }).distinct("_id");
+    filter["proId"] = { $in: ids };
+  }
+
+  const rows = await ProWarning.find(filter)
+    .sort({ issuedAt: -1 })
+    .limit(500)
+    .lean<ProWarningDoc[]>();
+
+  const result: TypedProWarning[] = rows.map((w) => ({
+    id: w._id,
+    proId: w.proId,
+    proName: w.proName,
+    reason: w.reason,
+    penaltyPaise: w.penaltyPaise,
+    issuedAt: w.issuedAt.toISOString(),
+    issuedBy: w.issuedBy,
+  }));
+  res.json(result);
+});
+
+/**
+ * Admin 17 — issue a warning, and optionally fine.
+ *
+ * Gated on `pros.block`, not `pros.approve_kyc`. A sub admin has onboarding
+ * delegated to them and discipline not, and a warning that takes money is the
+ * discipline half — fining a pro is nearer to stopping them working than to
+ * letting them start.
+ *
+ * The penalty writes a **ledger row in the same request**, so the discipline
+ * record and the pro's wallet cannot disagree about whether a fine was taken.
+ * It is deliberately not deferred: a penalty that waits would let the pro
+ * withdraw money they already owe back.
+ */
+adminProsRouter.post(
+  "/:id/warnings",
+  requirePermission("pros.block"),
+  async (req, res) => {
+    const proId = param(req, "id");
+    const pro = await Pro.findById(proId).lean<ProDoc>();
+    if (!pro) throw notFound("Pro not found.");
+
+    const why = reason(req.body, "A reason is required.");
+
+    // Positive paise, whole. A negative "penalty" would be a credit wearing a
+    // warning's label, and the ledger would pay someone for misconduct.
+    const raw = (req.body as { penaltyPaise?: unknown })?.penaltyPaise ?? 0;
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+      throw badRequest(
+        "A penalty is a whole number of paise, or zero.",
+        "BAD_PENALTY",
+      );
+    }
+
+    const actor = actorOf(req);
+    const now = new Date();
+    let ledgerId: string | undefined;
+
+    if (raw > 0) {
+      ledgerId = newId("ple");
+      await ProLedger.create({
+        _id: ledgerId,
+        proId,
+        kind: "penalty",
+        label: why,
+        // Negative in the ledger, positive on the warning: a balance there is
+        // a sum, and a switch on `kind` is how the two come to disagree.
+        amountPaise: -raw,
+        availableAt: now,
+        at: now,
+      });
+    }
+
+    const doc = await ProWarning.create({
+      _id: newId("warn"),
+      proId,
+      proName: pro.name,
+      reason: why,
+      penaltyPaise: raw,
+      ...(ledgerId !== undefined ? { ledgerId } : {}),
+      issuedBy: actor.name,
+      issuedAt: now,
+    });
+
+    await notify({
+      role: "pro",
+      to: proId,
+      kind: "warning",
+      title: raw > 0 ? "A warning, with a penalty" : "A warning has been issued",
+      body:
+        raw > 0
+          ? `${why} ₹${Math.round(raw / 100).toLocaleString("en-IN")} has been deducted.`
+          : why,
+      href: "/warnings",
+    });
+
+    await audit(actor, "pro.warning.issued", {
+      subject: proId,
+      detail: { reason: why, penaltyPaise: raw },
+    });
+
+    const result: TypedProWarning = {
+      id: doc._id,
+      proId: doc.proId,
+      proName: doc.proName,
+      reason: doc.reason,
+      penaltyPaise: doc.penaltyPaise,
+      issuedAt: doc.issuedAt.toISOString(),
+      issuedBy: doc.issuedBy,
+    };
+    res.status(201).json(result);
+  },
+);
+
+/**
  * Admin 12 — one pro, in full.
  *
  * Carries the bank **last four only**. The full account number is encrypted at
@@ -142,10 +283,14 @@ adminProsRouter.get("/:id", async (req, res) => {
   const pro = await Pro.findById(param(req, "id")).lean<ProDoc>();
   if (!pro) throw notFound("Pro not found.");
 
-  const names = await serviceNames(pro.serviceIds);
+  const [names, warningCount] = await Promise.all([
+    serviceNames(pro.serviceIds),
+    ProWarning.countDocuments({ proId: pro._id }),
+  ]);
 
   const detail: ProDetail = {
     ...toListItem(pro, names),
+    areas: pro.areas,
     bio: pro.bio,
     experienceYears: pro.experienceYears,
     bankAccountLast4: pro.bank?.accountLast4 ?? "",
@@ -165,7 +310,7 @@ adminProsRouter.get("/:id", async (req, res) => {
     }),
     totalEarnedPaise: 0,
     pendingPayoutPaise: 0,
-    warningCount: 0,
+    warningCount,
   };
 
   res.json(detail);
@@ -314,6 +459,16 @@ adminProsRouter.post(
       },
     );
 
+    // The one notification a pro is actually waiting for.
+    await notify({
+      role: "pro",
+      to: id,
+      kind: "announcement",
+      title: "You are approved",
+      body: "Your registration has been verified. Go online to start receiving jobs.",
+      href: "/jobs",
+    });
+
     await audit(actor, "pro.kyc.approved", {
       subject: id,
       detail: { name: pro.name },
@@ -347,6 +502,15 @@ adminProsRouter.post(
         },
       },
     );
+
+    await notify({
+      role: "pro",
+      to: id,
+      kind: "announcement",
+      title: "Registration not approved",
+      body: why,
+      href: "/onboarding",
+    });
 
     await audit(actor, "pro.kyc.rejected", {
       subject: id,
@@ -398,6 +562,15 @@ adminProsRouter.post(
         },
       );
     }
+
+    await notify({
+      role: "pro",
+      to: id,
+      kind: "announcement",
+      title: "More documents needed",
+      body: `${why} Please re-upload: ${types.join(", ")}.`,
+      href: "/onboarding",
+    });
 
     await audit(actorOf(req), "pro.documents.requested", {
       subject: id,

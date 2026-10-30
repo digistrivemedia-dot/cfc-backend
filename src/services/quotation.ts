@@ -1,6 +1,13 @@
 import { Booking, type BookingDoc } from "../models/booking";
 import { Customer, type CustomerDoc } from "../models/customer";
 import { Pro, type ProDoc } from "../models/pro";
+import { notify } from "../models/notification";
+
+/** Paise as plain rupees for a notification body. No decimals — these are
+ *  whole-rupee quotes and "₹4,500.00" reads like a bill, not an alert. */
+function rupees(paise: number): string {
+  return `₹${Math.round(paise / 100).toLocaleString("en-IN")}`;
+}
 import { Service, type ServiceDoc } from "../models/catalog";
 import {
   Quotation,
@@ -261,6 +268,17 @@ export async function decideQuotation(input: {
       { new: true },
     ).lean<QuotationDoc>();
 
+    if (updated) {
+      await notify({
+        role: "pro",
+        to: updated.proId,
+        kind: "quotation",
+        title: "Quotation rejected",
+        body: input.reason.trim(),
+        href: `/quotations/${updated._id}`,
+      });
+    }
+
     return updated
       ? { ok: true, quotation: updated }
       : { ok: false, reason: "That quotation is no longer pending." };
@@ -297,6 +315,28 @@ export async function decideQuotation(input: {
     { new: true },
   ).lean<QuotationDoc>();
 
+  if (updated) {
+    await notify({
+      role: "customer",
+      to: updated.customerId,
+      kind: "quotation",
+      title: "A quotation needs your approval",
+      body: `${updated.serviceName} — ${rupees(updated.totalPaise)}. A 50% advance is taken on acceptance.`,
+      href: `/quotations/${updated._id}`,
+    });
+    await notify({
+      role: "pro",
+      to: updated.proId,
+      kind: "quotation",
+      title: edited ? "Quotation approved, with edits" : "Quotation approved",
+      body: edited
+        // The pro must not learn the figure changed from their payout.
+        ? `The office approved ${rupees(updated.totalPaise)}. Your original figure is kept on the record.`
+        : "Sent to the customer for acceptance.",
+      href: `/quotations/${updated._id}`,
+    });
+  }
+
   return updated
     ? { ok: true, quotation: updated }
     : { ok: false, reason: "That quotation is no longer pending." };
@@ -314,8 +354,8 @@ export async function sweepQuotations(): Promise<{ expired: number }> {
     status: "pending",
     decisionBy: { $lt: new Date() },
   })
-    .select({ _id: 1, bookingId: 1 })
-    .lean<{ _id: string; bookingId: string }[]>();
+    .select({ _id: 1, bookingId: 1, proId: 1 })
+    .lean<{ _id: string; bookingId: string; proId: string }[]>();
 
   if (stale.length === 0) return { expired: 0 };
 
@@ -336,6 +376,14 @@ export async function sweepQuotations(): Promise<{ expired: number }> {
   );
 
   for (const q of stale) {
+    await notify({
+      role: "pro",
+      to: q.proId,
+      kind: "quotation",
+      title: "Quotation expired",
+      body: "The 15-minute window passed without a decision. Resubmit if you are still on site.",
+      href: `/quotations/${q._id}`,
+    });
     await Booking.updateOne(
       { _id: q.bookingId },
       {

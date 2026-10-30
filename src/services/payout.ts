@@ -3,6 +3,12 @@ import { ProLedger, proBalance } from "../models/pro-ledger";
 import { Pro, type ProDoc } from "../models/pro";
 import { open as unseal } from "../auth/secret-box";
 import { newId } from "../models/id";
+import { notify } from "../models/notification";
+
+/** Paise as whole rupees, for a notification body. */
+function rupees(paise: number): string {
+  return `₹${Math.round(paise / 100).toLocaleString("en-IN")}`;
+}
 import { getSettings } from "../models/settings";
 
 /**
@@ -165,9 +171,21 @@ export async function approvePayouts(
     const claimed = await Payout.findOneAndUpdate(
       { _id: id, status: "pending" },
       { $set: { status: "approved", approvedAt: new Date(), approvedBy: by } },
-    ).lean();
-    if (claimed) approved.push(id);
-    else skipped.push(id);
+    ).lean<PayoutDoc>();
+    if (claimed) {
+      approved.push(id);
+      await notify({
+        role: "pro",
+        to: claimed.proId,
+        kind: "payout",
+        title: "Payout approved",
+        // "Approved", never "paid": the transfer is what pays them, and the
+        // agreement gives it 48 hours. Saying paid here is a promise the
+        // platform has not kept yet.
+        body: `${rupees(claimed.amountPaise)} approved. It reaches your account within 48 hours.`,
+        href: "/payouts",
+      });
+    } else skipped.push(id);
   }
 
   return { approved, skipped };
@@ -193,6 +211,15 @@ export async function rejectPayout(
   ).lean<PayoutDoc>();
 
   if (!claimed) return { ok: false, reason: "That payout is no longer open." };
+
+  await notify({
+    role: "pro",
+    to: claimed.proId,
+    kind: "payout",
+    title: "Payout could not be sent",
+    body: `${reason} ${rupees(claimed.amountPaise)} has been returned to your wallet.`,
+    href: "/payouts",
+  });
 
   await ProLedger.create({
     _id: newId("ple"),

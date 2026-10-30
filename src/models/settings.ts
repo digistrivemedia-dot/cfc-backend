@@ -66,6 +66,58 @@ export interface SettingsDoc {
    */
   payoutMinimumPaise: number;
 
+  /**
+   * §5 — the facts that different screens currently state differently.
+   *
+   * `final/CONSUMER.md` §13 lists 17 of them, and a customer can see every
+   * one: the support number is `+91 90000 12345` in one place and
+   * `1800 XXX 4567` in another; hours are 9–9, 7–11 and 7–9 depending on the
+   * screen. They recur because there is no single source, so each becomes a
+   * field here and every screen reads it.
+   *
+   * **Every one defaults to empty.** The real values are §7.1 items the client
+   * has not supplied, and a plausible-looking default is worse than a blank:
+   * a wrong support number is one a customer actually rings. A screen with an
+   * empty value hides the row; a screen with a fabricated one lies.
+   */
+  supportPhone: string;
+  supportHours: string;
+  supportEmail: string;
+
+  /**
+   * The legal name, used in invoices and the footer.
+   *
+   * Three spellings are currently in use — "City Family Care",
+   * "CityFamilyCare", "CityFamilyCare Services Pvt Ltd". A tax invoice has to
+   * carry exactly one.
+   */
+  brandName: string;
+
+  /** GSTIN and registered address for the tax invoice. §7.1. */
+  gstin: string;
+  registeredAddress: string;
+
+  /**
+   * Fallback warranty when a service does not set its own.
+   *
+   * `warrantyDays` already exists per service. This is the default a new
+   * service starts from, not an override — the screens claiming a flat
+   * "30-day warranty" everywhere are the contradiction being fixed.
+   */
+  warrantyDefaultDays: number;
+
+  /**
+   * The cancellation policy, in the client's words, and its fee.
+   *
+   * **No policy exists anywhere today** (§7.2) — one screen says "free more
+   * than 2 hours ahead", another says no policy is stated on purpose, and the
+   * legal page has headings only. The fee stays at zero until the client sets
+   * one: charging a cancellation fee nobody agreed to is money taken without
+   * a basis.
+   */
+  cancellationPolicy: string;
+  cancellationFeePaise: number;
+
   updatedAt: Date;
 }
 
@@ -79,6 +131,15 @@ const settingsSchema = new Schema<SettingsDoc>(
     slotEndHour: { type: Number, default: 20 },
     gpsLimitMetres: { type: Number, default: 100 },
     payoutMinimumPaise: { type: Number, default: 0 },
+    supportPhone: { type: String, default: "" },
+    supportHours: { type: String, default: "" },
+    supportEmail: { type: String, default: "" },
+    brandName: { type: String, default: "" },
+    gstin: { type: String, default: "" },
+    registeredAddress: { type: String, default: "" },
+    warrantyDefaultDays: { type: Number, default: 30 },
+    cancellationPolicy: { type: String, default: "" },
+    cancellationFeePaise: { type: Number, default: 0 },
   },
   { timestamps: { createdAt: false, updatedAt: true }, versionKey: false },
 );
@@ -116,6 +177,15 @@ export async function getSettings(): Promise<SettingsDoc> {
     serviceAreas: doc?.serviceAreas ?? [],
     bookingHorizonDays: doc?.bookingHorizonDays ?? 30,
     slotMinutes: doc?.slotMinutes ?? 120,
+    supportPhone: doc?.supportPhone ?? "",
+    supportHours: doc?.supportHours ?? "",
+    supportEmail: doc?.supportEmail ?? "",
+    brandName: doc?.brandName ?? "",
+    gstin: doc?.gstin ?? "",
+    registeredAddress: doc?.registeredAddress ?? "",
+    warrantyDefaultDays: doc?.warrantyDefaultDays ?? 30,
+    cancellationPolicy: doc?.cancellationPolicy ?? "",
+    cancellationFeePaise: doc?.cancellationFeePaise ?? 0,
     slotStartHour: doc?.slotStartHour ?? 8,
     slotEndHour: doc?.slotEndHour ?? 20,
     gpsLimitMetres: doc?.gpsLimitMetres ?? 100,

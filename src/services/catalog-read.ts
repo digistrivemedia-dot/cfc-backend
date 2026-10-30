@@ -14,6 +14,8 @@ import {
   type ServiceDoc,
   type SubCategoryDoc,
 } from "../models/catalog";
+import { Booking as BookingModel } from "../models/booking";
+import { ratingsBy } from "../models/review";
 import { PUBLIC_PREFIX } from "../uploads";
 
 /**
@@ -207,6 +209,51 @@ async function serviceNames(
   );
 }
 
+export const EMPTY_STATS = { bookingCount: 0, rating: 0, reviewCount: 0 };
+
+/**
+ * Real booking and review figures for a set of services.
+ *
+ * These were hardcoded zeroes with a note saying "until the phases that create
+ * them" — bookings landed in Phase 5 and reviews in Phase 9, so both exist now
+ * and the note was the only thing still holding them at zero.
+ *
+ * A cancelled booking does not count: "most booked" is a claim about work
+ * people went through with, and counting abandoned ones inflates every figure
+ * the home screen sorts by.
+ */
+export async function serviceStats(
+  ids: string[],
+): Promise<Map<string, { bookingCount: number; rating: number; reviewCount: number }>> {
+  if (ids.length === 0) return new Map();
+
+  const [bookings, ratings] = await Promise.all([
+    BookingModel.aggregate<{ _id: string; count: number }>([
+      {
+        $match: {
+          serviceId: { $in: ids },
+          status: { $ne: "cancelled" },
+        },
+      },
+      { $group: { _id: "$serviceId", count: { $sum: 1 } } },
+    ]),
+    ratingsBy("serviceId", ids),
+  ]);
+
+  const byService = new Map(bookings.map((b) => [b._id, b.count]));
+
+  return new Map(
+    ids.map((id) => [
+      id,
+      {
+        bookingCount: byService.get(id) ?? 0,
+        rating: ratings.get(id)?.rating ?? 0,
+        reviewCount: ratings.get(id)?.reviewCount ?? 0,
+      },
+    ]),
+  );
+}
+
 export interface ServiceQuery {
   /** Free text. Uses the `service_search` text index when present. */
   search?: string | undefined;
@@ -243,19 +290,62 @@ export async function listServices(
     .sort({ name: 1 })
     .lean<ServiceDoc[]>();
   const names = await serviceNames(docs);
+  const stats = await serviceStats(docs.map((d) => d._id));
 
   return docs.map((d) => {
     const n = names.get(d._id);
-    return toServiceDetail(d, n?.category ?? "", n?.sub ?? "");
+    return toServiceDetail(
+      d,
+      n?.category ?? "",
+      n?.sub ?? "",
+      stats.get(d._id) ?? EMPTY_STATS,
+    );
   });
 }
 
 export async function findService(id: string): Promise<ServiceDetail | null> {
   const doc = await ServiceModel.findById(id).lean<ServiceDoc>();
   if (!doc) return null;
-  const names = await serviceNames([doc]);
+  const [names, stats] = await Promise.all([
+    serviceNames([doc]),
+    serviceStats([doc._id]),
+  ]);
   const n = names.get(doc._id);
-  return toServiceDetail(doc, n?.category ?? "", n?.sub ?? "");
+  return toServiceDetail(
+    doc,
+    n?.category ?? "",
+    n?.sub ?? "",
+    stats.get(doc._id) ?? EMPTY_STATS,
+  );
+}
+
+/**
+ * Customer search — per-word, order and position free.
+ *
+ * Matches the service name, its category and its sub-category, so "cleaning"
+ * finds everything under Cleaning rather than only the rows with the word in
+ * their own name. A customer searching a category term and getting nothing is
+ * the most common way search feels broken.
+ *
+ * Done in memory over the active catalogue rather than in the query, because
+ * the haystack spans two joined collections — the category and sub-category
+ * names are not on the service document. At ~50 services that is one scan of a
+ * list the page was already fetching.
+ *
+ * `ponytail:` *in-memory AND over the catalogue. Denormalise the category and
+ * sub-category names onto the service and push this into the query if the
+ * catalogue reaches the thousands — it is tens today.*
+ */
+export async function searchCatalogue(query: string): Promise<ServiceDetail[]> {
+  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [];
+
+  const all = await listServices({ activeOnly: true });
+  return all.filter((s) => {
+    const haystack =
+      `${s.name} ${s.categoryName} ${s.subCategoryName}`.toLowerCase();
+    return words.every((w) => haystack.includes(w));
+  });
 }
 
 // -- Pricing and commission --------------------------------------------------

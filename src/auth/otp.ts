@@ -111,7 +111,12 @@ export async function sendOtp(
   const now = Date.now();
 
   const existing = await Otp.findById(key).lean<OtpDoc>();
-  if (existing && existing.resendAfter.getTime() > now) {
+
+  // The 30-second resend lock is lifted with the dummy, for the same reason
+  // the rate limiter is: it exists to protect an SMS budget, and there is no
+  // SMS. Leaving it on made a developer wait half a minute between attempts
+  // at a code that is not checked anyway.
+  if (!env.dummyOtp && existing && existing.resendAfter.getTime() > now) {
     const wait = Math.ceil((existing.resendAfter.getTime() - now) / 1000);
     throw new ApiError(
       429,
@@ -171,6 +176,46 @@ export async function verifyOtp(
   }
 
   const key = `${purpose}:${phone}`;
+
+  /**
+   * While `AUTH_DUMMY_OTP` is on, **any correctly-shaped code is accepted**,
+   * with no record required.
+   *
+   * There is no SMS provider until the client's DLT templates clear, so there
+   * is nothing for a "real" code to be. Requiring one meant a tester had to
+   * have a live, unexpired, under-the-attempt-cap record before the dummy
+   * would even be considered — and a rate-limited send or a code left to age
+   * out locked them out of an app with no other way in.
+   *
+   * So the whole check is skipped. A developer types any six digits against
+   * any throwaway number and gets in, which is the point: the product above
+   * this line can be exercised end to end while the SMS below it does not
+   * exist yet.
+   *
+   * ## What this is NOT
+   *
+   * It is not a weakening of the real path. Everything below — the hash
+   * comparison, expiry, the attempt cap, single use — is untouched and is
+   * exactly what runs the moment `AUTH_DUMMY_OTP=false`. Turning DLT on is a
+   * one-line env change, not a rewrite.
+   *
+   * ## The guard
+   *
+   * **`env.ts` refuses to boot with `AUTH_DUMMY_OTP=true` under
+   * `NODE_ENV=production`.** That single check is the only thing standing
+   * between this and anyone signing in as anyone. Do not relax it to get a
+   * deploy out.
+   */
+  if (env.dummyOtp) {
+    // Length is still enforced above, so a stray keypress is still refused and
+    // the screen's own validation keeps behaving as it will in production.
+    //
+    // Any record in flight is cleared, so a real code cannot be replayed once
+    // the dummy is switched off.
+    await Otp.findByIdAndDelete(key);
+    return;
+  }
+
   const record = await Otp.findById(key).lean<OtpDoc>();
 
   // Same message for "never requested", "already used" and "expired": each is
@@ -202,12 +247,9 @@ export async function verifyOtp(
     supplied.length === expected.length &&
     timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
 
-  // The master code is the single concession to the missing DLT registration,
-  // and it is one boolean away from gone. It is checked *after* the real code,
-  // so the real path is the one being exercised day to day.
-  const masterAccepted = env.dummyOtp && code === env.masterOtp;
-
-  if (!matches && !masterAccepted) {
+  // The master code was handled above; everything from here is the real path,
+  // unchanged, and it is what runs once DLT clears and the dummy goes off.
+  if (!matches) {
     // Counted before refusing, or the cap never bites.
     await Otp.findByIdAndUpdate(key, { $inc: { attempts: 1 } });
     const left = MAX_ATTEMPTS - (record.attempts + 1);

@@ -2,6 +2,7 @@ import { Booking, newCompletionOtp, type BookingDoc } from "../models/booking";
 import { DispatchAlert, Offer, type OfferDoc } from "../models/offer";
 import { Pro, canReceiveOffers, ratingOf, type ProDoc } from "../models/pro";
 import { newId } from "../models/id";
+import { notify } from "../models/notification";
 import { getSettings } from "../models/settings";
 
 /**
@@ -242,6 +243,28 @@ export async function acceptOffer(
     },
     { new: true },
   ).lean<BookingDoc>();
+
+  if (claimed) {
+    // Both sides are told, from the one place the assignment actually happens.
+    // The customer's address and phone were withheld from the offer; they are
+    // released to the pro in the accept response, not here.
+    await notify({
+      role: "customer",
+      to: claimed.customerId,
+      kind: "booking",
+      title: `${pro.name} is on the way`,
+      body: `Your ${claimed.serviceName} booking ${claimed.reference} has been assigned.`,
+      href: `/bookings/${claimed.reference}`,
+    });
+    await notify({
+      role: "pro",
+      to: proId,
+      kind: "job",
+      title: "Job accepted",
+      body: `${claimed.serviceName} — ${claimed.reference}.`,
+      href: `/jobs/${claimed._id}`,
+    });
+  }
 
   if (!claimed) {
     // Someone else got there first. Not an error — the documented rule working.

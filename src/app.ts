@@ -8,17 +8,39 @@ import { publicRouter } from "./routes/public";
 import { adminAuthRouter } from "./routes/admin/auth";
 import { adminCatalogRouter } from "./routes/admin/catalog";
 import { adminProsRouter } from "./routes/admin/pros";
+import { adminCustomersRouter } from "./routes/admin/customers";
+import { adminBookingsRouter } from "./routes/admin/bookings";
 import { adminDispatchRouter } from "./routes/admin/dispatch";
 import { adminQuotationsRouter } from "./routes/admin/quotations";
 import { adminPayoutsRouter } from "./routes/admin/payouts";
+import { adminDashboardRouter, adminFinanceRouter } from "./routes/admin/finance";
+import { adminReportsRouter } from "./routes/admin/reports";
+import {
+  adminPromotionsRouter,
+  adminUsersRouter,
+} from "./routes/admin/promotions";
+import { adminSettingsRouter } from "./routes/admin/settings";
+import { adminFaqRouter } from "./routes/admin/faqs";
+import {
+  adminTicketRouter,
+  consumerTicketRouter,
+  proTicketRouter,
+} from "./routes/tickets";
 import { proOnboardingRouter } from "./routes/pro/onboarding";
 import { proJobsRouter } from "./routes/pro/jobs";
 import { proEarningsRouter } from "./routes/pro/earnings";
+import { proReviewRouter } from "./routes/pro/reviews";
+import { proProfileRouter } from "./routes/pro/profile";
 import { consumerAuthRouter } from "./routes/consumer/auth";
 import { consumerAddressRouter } from "./routes/consumer/addresses";
 import { consumerBookingRouter } from "./routes/consumer/bookings";
 import { consumerWalletRouter } from "./routes/consumer/wallet";
 import { consumerQuotationsRouter } from "./routes/consumer/quotations";
+import { consumerReviewRouter } from "./routes/consumer/reviews";
+import {
+  consumerNotificationRouter,
+  proNotificationRouter,
+} from "./routes/notifications";
 
 /**
  * The Express app, assembled.
@@ -94,9 +116,20 @@ export function createApp(): Express {
   app.use("/api/admin/auth", adminAuthRouter);
   app.use("/api/admin/catalog", adminCatalogRouter);
   app.use("/api/admin/pros", adminProsRouter);
+  app.use("/api/admin/customers", adminCustomersRouter);
+  app.use("/api/admin/bookings", adminBookingsRouter);
   app.use("/api/admin/dispatch", adminDispatchRouter);
   app.use("/api/admin/quotations", adminQuotationsRouter);
   app.use("/api/admin/payouts", adminPayoutsRouter);
+  app.use("/api/admin/dashboard", adminDashboardRouter);
+  app.use("/api/admin/finance", adminFinanceRouter);
+  app.use("/api/admin/reports", adminReportsRouter);
+  app.use("/api/admin/promotions", adminPromotionsRouter);
+  app.use("/api/admin/users", adminUsersRouter);
+  app.use("/api/admin/settings", adminSettingsRouter);
+  app.use("/api/admin/faqs", adminFaqRouter);
+
+  app.use("/api/admin/tickets", adminTicketRouter);
 
   /**
    * Pro. Onboarding is partly unauthenticated by necessity — the OTP routes are
@@ -106,6 +139,10 @@ export function createApp(): Express {
   app.use("/api/pro", proOnboardingRouter);
   app.use("/api/pro", proJobsRouter);
   app.use("/api/pro/earnings", proEarningsRouter);
+  app.use("/api/pro/notifications", proNotificationRouter);
+  app.use("/api/pro/tickets", proTicketRouter);
+  app.use("/api/pro/reviews", proReviewRouter);
+  app.use("/api/pro/profile", proProfileRouter);
 
   /** Customer. Only the OTP routes are reachable without a token. */
   app.use("/api/consumer/auth", consumerAuthRouter);
@@ -113,6 +150,9 @@ export function createApp(): Express {
   app.use("/api/consumer/bookings", consumerBookingRouter);
   app.use("/api/consumer/wallet", consumerWalletRouter);
   app.use("/api/consumer/quotations", consumerQuotationsRouter);
+  app.use("/api/consumer/reviews", consumerReviewRouter);
+  app.use("/api/consumer/notifications", consumerNotificationRouter);
+  app.use("/api/consumer/tickets", consumerTicketRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

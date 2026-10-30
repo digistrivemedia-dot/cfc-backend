@@ -1,5 +1,6 @@
 import { CFC_COMMISSION_BPS, COMMISSION_FREE_JOBS } from "@cfc/types";
 import { Booking, canTransition, type BookingDoc } from "../models/booking";
+import { notify } from "../models/notification";
 import { Pro, type ProDoc } from "../models/pro";
 import { getSettings } from "../models/settings";
 import { newId } from "../models/id";
@@ -124,6 +125,15 @@ export async function startJob(
   ).lean<BookingDoc>();
 
   if (!updated) return { ok: false, reason: "That job is no longer startable." };
+
+  await notify({
+    role: "customer",
+    to: updated.customerId,
+    kind: "booking",
+    title: "Work has started",
+    body: `${updated.serviceName} — ${updated.reference}.`,
+    href: `/bookings/${updated.reference}`,
+  });
   return { ok: true, booking: updated };
 }
 
@@ -245,6 +255,25 @@ export async function completeJob(input: {
     },
     { new: true },
   ).lean<BookingDoc>();
+
+  if (updated) {
+    await notify({
+      role: "customer",
+      to: updated.customerId,
+      kind: "booking",
+      title: "Job completed",
+      body: `${updated.serviceName} is done. Tap to rate ${pro.name}.`,
+      href: `/bookings/${updated.reference}`,
+    });
+    await notify({
+      role: "pro",
+      to: pro._id,
+      kind: "payout",
+      title: "Job settled",
+      body: `${updated.reference} — your earning has been credited.`,
+      href: "/earnings",
+    });
+  }
 
   if (!updated) {
     return {

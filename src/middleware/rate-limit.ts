@@ -1,5 +1,6 @@
 import type { Request, RequestHandler } from "express";
 import { ApiError } from "../error";
+import { env } from "../env";
 
 /**
  * A fixed-window rate limiter, in process memory.
@@ -48,6 +49,18 @@ export interface RateLimitOptions {
   keyOf?: (req: Request) => string;
   /** Shown to the caller. Says what to do, not how the limiter works. */
   message?: string;
+  /**
+   * Lifted while `AUTH_DUMMY_OTP` is on.
+   *
+   * For the OTP endpoints only. The limit exists to protect an SMS budget and
+   * to stop code-guessing — and with the dummy on there is no SMS to spend
+   * and no code to guess, so all it does is lock a developer out of the app
+   * after five attempts with no way back in but waiting fifteen minutes.
+   *
+   * The limiter itself is untouched and returns the moment the dummy goes
+   * off, which is the moment there is a budget to protect.
+   */
+  relaxedWhenDummyOtp?: boolean;
 }
 
 export function rateLimit(options: RateLimitOptions): RequestHandler {
@@ -56,9 +69,15 @@ export function rateLimit(options: RateLimitOptions): RequestHandler {
     max,
     keyOf = (req) => req.ip ?? "unknown",
     message = "Too many attempts. Please wait a moment and try again.",
+    relaxedWhenDummyOtp = false,
   } = options;
 
   return (req, res, next) => {
+    if (relaxedWhenDummyOtp && env.dummyOtp) {
+      next();
+      return;
+    }
+
     const key = `${req.method} ${req.route?.path ?? req.path}:${keyOf(req)}`;
     const now = Date.now();
     const existing = buckets.get(key);

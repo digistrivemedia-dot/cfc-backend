@@ -39,6 +39,7 @@ consumerAuthRouter.post(
   rateLimit({
     windowSeconds: 15 * 60,
     max: 5,
+    relaxedWhenDummyOtp: true,
     keyOf: (req) => {
       const phone = (req.body as { phone?: unknown } | undefined)?.phone;
       return `${req.ip ?? "unknown"}|${typeof phone === "string" ? phone : ""}`;
@@ -59,7 +60,7 @@ consumerAuthRouter.post(
  */
 consumerAuthRouter.post(
   "/otp/verify",
-  rateLimit({ windowSeconds: 15 * 60, max: 10 }),
+  rateLimit({ windowSeconds: 15 * 60, max: 10, relaxedWhenDummyOtp: true }),
   async (req, res) => {
     const phone = normalisePhone((req.body as { phone?: unknown })?.phone);
     await verifyOtp(phone, "customer", (req.body as { code?: unknown })?.code);
