@@ -1011,6 +1011,87 @@ async function checkProOnboarding(
       assert.equal(photoAfter.bio, "Twelve years on ACs.");
     });
 
+    // The pro's own profile screen reads this. It used to call
+    // `GET /admin/pros/:id` — an admin route — and got a 403 on every load,
+    // which it reported to the pro as a connection problem.
+    const self = await get("/pro/profile", proToken);
+    const selfBody = (await self.json()) as Record<string, unknown>;
+    check("a pro can read their own profile", () => {
+      assert.equal(self.status, 200);
+      for (const field of [
+        "id",
+        "name",
+        "area",
+        "services",
+        "experienceYears",
+        "rating",
+        "jobsCompleted",
+        "approvalStatus",
+        "blocked",
+      ]) {
+        assert.ok(field in selfBody, `self-profile is missing "${field}"`);
+      }
+    });
+
+    check("the self-profile carries payments, performance and the record", () => {
+      // One request serves six screens: the shell, the splash routing
+      // decision, the profile, the edit form, the warnings screen and job
+      // completion. Each used to ask a different admin endpoint and get a 403.
+      const payments = selfBody["payments"] as Record<string, unknown>;
+      const performance = selfBody["performance"] as Record<string, unknown>;
+      assert.ok(payments, "no payments section");
+      assert.ok(performance, "no performance section");
+      for (const field of [
+        "accountLast4",
+        "ifsc",
+        "upiId",
+        "availablePaise",
+        "pendingPaise",
+        "canWithdraw",
+      ]) {
+        assert.ok(field in payments, `payments is missing "${field}"`);
+      }
+      for (const field of [
+        "grossPaise",
+        "netPaise",
+        "jobCount",
+        "commissionFreeRemaining",
+        "warningCount",
+      ]) {
+        assert.ok(field in performance, `performance is missing "${field}"`);
+      }
+      assert.ok(Array.isArray(selfBody["documents"]), "documents is not a list");
+      assert.ok(Array.isArray(selfBody["warnings"]), "warnings is not a list");
+    });
+
+    check("the full account number is never returned, even to its owner", () => {
+      // The server cannot return what it does not keep in the clear, and this
+      // asserts that rather than trusting it.
+      assert.ok(
+        !JSON.stringify(selfBody).includes("123456789012"),
+        "the self-profile echoed the full account number",
+      );
+    });
+
+    check("the self-profile withholds reviewer-only internals", () => {
+      // The pro gets their own bank last-four and UPI id, which they typed and
+      // their edit form needs — but not the document file paths or the review
+      // metadata a reviewer works with.
+      assert.ok(!("bank" in selfBody), "self-profile leaks the raw bank object");
+      assert.ok(!("reviewedBy" in selfBody), "self-profile leaks reviewedBy");
+      for (const doc of selfBody["documents"] as Record<string, unknown>[]) {
+        assert.ok(!("filePath" in doc), "self-profile leaks a document path");
+      }
+    });
+
+    const selfAsAdmin = await get("/pro/profile", adminToken);
+    check("an admin token cannot read it in a pro's place", () => {
+      // The id comes from the token, so there is no id to substitute — but the
+      // role still has to be checked, or an admin session reading this route
+      // would 500 looking for a pro that does not exist.
+      assert.equal(selfAsAdmin.status, 403);
+    });
+
     // -- documents ----------------------------------------------------------
     const uploadDoc = async (type: string) => {
       const form = new FormData();
