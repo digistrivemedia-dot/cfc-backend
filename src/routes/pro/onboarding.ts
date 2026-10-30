@@ -6,7 +6,15 @@ import { badRequest, conflict, forbidden, notFound } from "../../error";
 import { signToken } from "../../auth/token";
 import { normalisePhone, sendOtp, verifyOtp, RESEND_SECONDS } from "../../auth/otp";
 import { last4, seal } from "../../auth/secret-box";
-import { Pro, type ProDoc } from "../../models/pro";
+import { Pro, ratingOf, type ProDoc } from "../../models/pro";
+import { ProWarning, type ProWarningDoc } from "../../models/pro-warning";
+import { proBalance } from "../../models/pro-ledger";
+import { getSettings } from "../../models/settings";
+import {
+  commissionFreeRemaining,
+  earningsSummary,
+} from "../../services/earnings";
+import { Payout } from "../../services/payout";
 import { Service } from "../../models/catalog";
 import { newId } from "../../models/id";
 import { actorOf, requireAuth } from "../../middleware/auth";
@@ -220,6 +228,162 @@ proOnboardingRouter.post("/register", requireAuth, async (req, res) => {
 });
 
 // -- Profile (Pro 5) ----------------------------------------------------------
+
+/**
+ * The signed-in pro's whole record, in one request.
+ *
+ * **Registered before the `/profile/...` sub-routes** that `proProfileRouter`
+ * owns, and that is fine: Express matches on the full path, so `GET /profile`
+ * here and `GET /profile/services` there do not collide.
+ *
+ * ## Why this exists at all
+ *
+ * There was no pro-side profile route, so six screens in the pro app called
+ * `GET /admin/pros/:id` — an **admin** route — with a pro's token. Every one of
+ * them got a 403. The profile screen reported it as "Check your connection",
+ * the shell silently showed no name, and the splash screen's `catch` sent every
+ * pro to onboarding whatever their real approval status was.
+ *
+ * ## Why one endpoint and not five
+ *
+ * The five screens each wanted a different slice: the shell a name, the splash
+ * an approval status, the edit form a phone and UPI id, the warnings screen a
+ * rating and the discipline record, the job-completion screen a job count.
+ * Five endpoints would be five round trips for the profile screen, which shows
+ * all of it. The queries are all keyed on one indexed `proId`, so composing
+ * them server-side costs a single trip instead of five.
+ *
+ * ## The id comes from the token
+ *
+ * Never from the path or the body. A client-sent id on a route like this is how
+ * one pro reads another's record — and the admin shape it was borrowing carries
+ * someone's phone number and bank details.
+ *
+ * ## Still not `ProDetail`
+ *
+ * The admin shape is built for a reviewer. This one is built for the pro: it
+ * carries their own bank last-four and UPI id, which they typed and which their
+ * edit form needs, and **not** the KYC document file paths or the internal
+ * review metadata a reviewer works with.
+ */
+proOnboardingRouter.get("/profile", requireAuth, async (req, res) => {
+  const actor = proActor(req);
+  const pro = await loadPro(actor.id);
+
+  const [names, balance, settings, inFlight, summary, freeLeft, warnings] =
+    await Promise.all([
+      Service.find({ _id: { $in: pro.serviceIds } })
+        .select({ name: 1 })
+        .lean<{ _id: string; name: string }[]>(),
+      proBalance(pro._id),
+      getSettings(),
+      Payout.findOne({
+        proId: pro._id,
+        status: { $in: ["pending", "approved"] },
+      }).lean(),
+      // Lifetime, not a window: this is the profile's headline figure, and a
+      // pro reading "total earned" means since they joined.
+      earningsSummary(pro._id, "month"),
+      commissionFreeRemaining(pro._id),
+      ProWarning.find({ proId: pro._id })
+        .sort({ issuedAt: -1 })
+        .lean<ProWarningDoc[]>(),
+    ]);
+
+  const nameOf = new Map(names.map((s) => [s._id, s.name]));
+
+  res.json({
+    // -- who they are ------------------------------------------------------
+    id: pro._id,
+    name: pro.name,
+    phone: pro.phone,
+    photoUrl: pro.photoPath ? `${PUBLIC_PREFIX}/${pro.photoPath}` : null,
+    // Names here, ids on the way in: a pro reads "AC service & repair", and
+    // the catalogue is the authority on what that is called today.
+    services: pro.serviceIds.map((id) => nameOf.get(id) ?? id),
+    areas: pro.areas,
+    // `area` singular alongside `areas`, because the screens show one line and
+    // the record holds several. Dispatch matches against all of them.
+    area: pro.areas[0] ?? "",
+    bio: pro.bio,
+    experienceYears: pro.experienceYears,
+    joinedAt: pro.createdAt.toISOString(),
+
+    // -- where they stand --------------------------------------------------
+    approvalStatus: pro.approvalStatus,
+    rejectionReason: pro.rejectionReason ?? null,
+    blocked: pro.blocked,
+    blockedReason: pro.blockedReason ?? null,
+    // A blocked pro cannot be online whatever the flag says, so the projection
+    // enforces it rather than leaving each screen to remember.
+    online: pro.online && !pro.blocked,
+    rating: ratingOf(pro),
+    ratingCount: pro.ratingCount,
+    jobsCompleted: pro.jobsCompleted,
+
+    // -- money -------------------------------------------------------------
+    //
+    // The pro's own bank details: the last four and the IFSC, never the full
+    // account number. Not even to the pro who typed it — the server cannot
+    // return what it does not keep in the clear.
+    payments: {
+      accountName: pro.bank?.accountName ?? null,
+      accountLast4: pro.bank?.accountLast4 ?? null,
+      ifsc: pro.bank?.ifsc ?? null,
+      upiId: pro.bank?.upiId ?? null,
+      availablePaise: balance.availablePaise,
+      // Money from completed jobs that has not cleared the 48-hour window.
+      pendingPaise: balance.pendingPaise,
+      minimumPaise: settings.payoutMinimumPaise,
+      canWithdraw:
+        balance.availablePaise > 0 &&
+        balance.availablePaise >= settings.payoutMinimumPaise &&
+        inFlight === null,
+      requestInFlight: inFlight !== null,
+    },
+
+    // -- how they are doing ------------------------------------------------
+    performance: {
+      grossPaise: summary.grossPaise,
+      cfcFeePaise: summary.cfcFeePaise,
+      netPaise: summary.netPaise,
+      jobCount: summary.jobCount,
+      commissionFreeRemaining: freeLeft,
+      warningCount: warnings.length,
+    },
+
+    // -- the record --------------------------------------------------------
+    //
+    // `missing` is distinct from `pending`: pending means a human is looking at
+    // it, missing means the pro has not sent it. A screen showing both as
+    // "pending" leaves a pro waiting on a review that cannot start.
+    documents: REQUIRED_TYPES.map((type) => {
+      const found = pro.documents.find((d) => d.type === type);
+      return {
+        type,
+        label: DOCUMENT_LABELS[type],
+        status: found?.status ?? "missing",
+        uploaded: found !== undefined,
+        rejectionReason:
+          found?.status === "rejected" ? (found.rejectionReason ?? null) : null,
+      };
+    }),
+    // The discipline record. There was no pro-side route for this at all, so
+    // the warnings screen was reading the admin's cross-pro endpoint and
+    // getting a 403.
+    warnings: warnings.map((w) => ({
+      id: w._id,
+      reason: w.reason,
+      // Positive: the size of the fine. The matching negative wallet row is
+      // written by the admin route that issued it.
+      penaltyPaise: w.penaltyPaise,
+      // The pro's own card says "issued by ..." — a deduction from someone's
+      // pay with no name attached is not accountable.
+      issuedBy: w.issuedBy,
+      issuedAt: w.issuedAt.toISOString(),
+    })),
+  });
+});
 
 proOnboardingRouter.patch("/profile", requireAuth, async (req, res) => {
   const actor = proActor(req);
