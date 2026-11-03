@@ -84,7 +84,8 @@ export function grossFor(booking: BookingDoc): number {
 
 export type StartResult =
   | { ok: true; booking: BookingDoc }
-  | { ok: false; reason: string };
+  /** `wrongOtp` lets the screen highlight the field rather than show a banner. */
+  | { ok: false; reason: string; wrongOtp?: boolean };
 
 /**
  * Pro 15 — the pro has arrived and is starting work.
@@ -97,12 +98,31 @@ export type StartResult =
 export async function startJob(
   proId: string,
   bookingId: string,
+  /**
+   * The code the customer reads out at the door.
+   *
+   * **This is the start gate.** The pro used to tap "I'm Here" and the job
+   * began on their word alone — nothing connected the start of the clock to
+   * the customer actually being there and agreeing. A code the customer holds
+   * is that connection.
+   */
+  otp: string,
 ): Promise<StartResult> {
   const booking = await Booking.findOne({
     _id: bookingId,
     proId,
   }).lean<BookingDoc>();
   if (!booking) return { ok: false, reason: "That job could not be found." };
+
+  // Compared before the transition check, so a wrong code never advances a
+  // job and never reports a confusing status error instead of the real one.
+  if (!booking.startOtp || otp.trim() !== booking.startOtp) {
+    return {
+      ok: false,
+      reason: "That code is not right. Ask the customer to read it again.",
+      wrongOtp: true,
+    };
+  }
 
   if (!canTransition(booking.status, "in_progress")) {
     return {
@@ -198,7 +218,9 @@ export async function completeJob(input: {
     return { ok: false, error: { reason: "wrong-otp" } };
   }
 
-  // 2. At least one after-photo.
+  // 2. At least one piece of after-proof — a photo **or** a video. Both land
+  // in the same array, so either satisfies this: a pro who filmed the running
+  // AC should not also be made to take a still of it.
   if (booking.afterPhotoPaths.length < 1) {
     return { ok: false, error: { reason: "no-after-photos" } };
   }

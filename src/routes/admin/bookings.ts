@@ -15,6 +15,7 @@ import {
 } from "../../middleware/auth";
 import { Booking, type BookingDoc } from "../../models/booking";
 import { Pro, type ProDoc } from "../../models/pro";
+import { PUBLIC_PREFIX } from "../../uploads";
 import { audit } from "../../models/audit";
 import { param } from "../../params";
 
@@ -167,6 +168,16 @@ async function buildDetail(doc: BookingDoc): Promise<BookingDetail> {
     proPayoutPaise: doc.settlement?.netPaise ?? 0,
     paymentMethod: doc.paymentMethod,
     paid: doc.paid,
+    /**
+     * The job's own evidence — what the professional walked into and what
+     * they left. Photos and videos both.
+     *
+     * The office had no way to see any of it, which is the one thing a
+     * complaint actually turns on: "they said it was done" against a photo of
+     * it done. Served from the public root, so these are plain URLs.
+     */
+    beforePhotoUrls: doc.beforePhotoPaths.map((f) => `${PUBLIC_PREFIX}/${f}`),
+    afterPhotoUrls: doc.afterPhotoPaths.map((f) => `${PUBLIC_PREFIX}/${f}`),
   };
 }
 

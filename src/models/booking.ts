@@ -107,6 +107,15 @@ export interface BookingDoc {
    * Generated at assignment and revealed to the customer only once a pro is on
    * the way — a code visible for days is a code that leaks.
    */
+  /**
+   * The code the customer reads out when the professional arrives.
+   *
+   * Visible to the customer **from assignment**, unlike `completionOtp` which
+   * is held back until the pro is on the way: the start code is the first
+   * thing that happens at the door, and a customer hunting for it while
+   * somebody waits is worse than it sitting on their booking screen.
+   */
+  startOtp: string | null;
   completionOtp: string | null;
 
   beforePhotoPaths: string[];
@@ -213,6 +222,7 @@ const bookingSchema = new Schema<BookingDoc>(
     paid: { type: Boolean, default: false },
 
     proId: { type: String, default: null, index: true },
+    startOtp: { type: String, default: null },
     completionOtp: { type: String, default: null },
 
     beforePhotoPaths: { type: [String], default: [] },
@@ -295,7 +305,22 @@ export function newReference(): string {
   return `CFC${n}`;
 }
 
-/** The completion OTP a customer shows the pro. Six digits, like every other. */
-export function newCompletionOtp(): string {
-  return String(Math.floor(100_000 + Math.random() * 899_999));
+/**
+ * A job code the customer reads out to the professional. **Four digits.**
+ *
+ * Four, not six: it is read aloud at a doorstep and typed on a phone, and the
+ * pro app's entry field has always been four boxes. The server generated six,
+ * so the pro could not enter a valid code at all — the field would not accept
+ * the fifth digit. The two agree now.
+ *
+ * Not a security token. It proves the customer is standing there and agrees
+ * the work is starting or finished; the session behind the request is what
+ * proves who the professional is. Guessing one in a thousand costs an attacker
+ * a job they would still have to physically attend.
+ */
+export function newJobOtp(): string {
+  return String(Math.floor(1_000 + Math.random() * 9_000));
 }
+
+/** @deprecated Use `newJobOtp`. Kept so older imports keep compiling. */
+export const newCompletionOtp = newJobOtp;

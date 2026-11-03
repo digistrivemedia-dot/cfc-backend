@@ -33,6 +33,7 @@ import { proReviewRouter } from "./routes/pro/reviews";
 import { proProfileRouter } from "./routes/pro/profile";
 import { consumerAuthRouter } from "./routes/consumer/auth";
 import { consumerAddressRouter } from "./routes/consumer/addresses";
+import { consumerGeocodeRouter } from "./routes/consumer/geocode";
 import { consumerBookingRouter } from "./routes/consumer/bookings";
 import { consumerWalletRouter } from "./routes/consumer/wallet";
 import { consumerQuotationsRouter } from "./routes/consumer/quotations";
@@ -147,6 +148,7 @@ export function createApp(): Express {
   /** Customer. Only the OTP routes are reachable without a token. */
   app.use("/api/consumer/auth", consumerAuthRouter);
   app.use("/api/consumer/addresses", consumerAddressRouter);
+  app.use("/api/consumer/geocode", consumerGeocodeRouter);
   app.use("/api/consumer/bookings", consumerBookingRouter);
   app.use("/api/consumer/wallet", consumerWalletRouter);
   app.use("/api/consumer/quotations", consumerQuotationsRouter);

@@ -7,6 +7,7 @@ import { Pro, type ProDoc } from "../../models/pro";
 import { Service, type ServiceDoc } from "../../models/catalog";
 import { SubCategory, Category } from "../../models/catalog";
 import { Booking } from "../../models/booking";
+import { getSettings } from "../../models/settings";
 import { settle } from "../../services/job-lifecycle";
 import { param } from "../../params";
 
@@ -109,6 +110,58 @@ function defaultWeek(): ProAvailability["days"] {
     to: "18:00",
   }));
 }
+
+/**
+ * Pro 28 — the pincodes this pro will travel to.
+ *
+ * Their own, and only from the platform's list: a pro cannot add a pincode CFC
+ * does not serve, because dispatch would never send them a booking there and
+ * the screen would be promising work that cannot arrive.
+ */
+proProfileRouter.get("/pincodes", async (req, res) => {
+  const [pro, settings] = await Promise.all([
+    Pro.findById(actorOf(req).id).select({ pincodes: 1 }).lean<{ pincodes?: string[] }>(),
+    getSettings(),
+  ]);
+  res.json({
+    mine: pro?.pincodes ?? [],
+    /** Everything they may choose from, so the screen needs one call. */
+    available: settings.servicePincodes,
+  });
+});
+
+proProfileRouter.put("/pincodes", async (req, res) => {
+  const raw = (req.body as { pincodes?: unknown })?.pincodes;
+  if (!Array.isArray(raw)) {
+    throw badRequest("Which pincodes?", "MISSING_FIELD");
+  }
+
+  const wanted = [
+    ...new Set(
+      raw
+        .filter((v): v is string => typeof v === "string")
+        .map((v) => v.trim())
+        .filter((v) => v !== ""),
+    ),
+  ];
+
+  const { servicePincodes } = await getSettings();
+  // Refused rather than silently dropped: a pro who ticks a pincode and sees
+  // it vanish on reload has been told nothing about why.
+  const outside = wanted.find((p) => !servicePincodes.includes(p));
+  if (outside !== undefined) {
+    throw badRequest(
+      `CFC does not operate in ${outside} yet.`,
+      "PINCODE_NOT_SERVED",
+    );
+  }
+
+  await Pro.updateOne(
+    { _id: actorOf(req).id },
+    { $set: { pincodes: wanted } },
+  );
+  res.json({ mine: wanted, available: servicePincodes });
+});
 
 proProfileRouter.get("/availability", async (req, res) => {
   const pro = await Pro.findById(actorOf(req).id).lean<ProDoc>();

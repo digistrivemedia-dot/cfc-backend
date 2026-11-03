@@ -404,6 +404,24 @@ proOnboardingRouter.patch("/profile", requireAuth, async (req, res) => {
             ? Math.floor(experience)
             : pro.experienceYears,
         ...(areas.length > 0 ? { areas } : {}),
+        /**
+         * The UPI handle, and **only** the UPI handle.
+         *
+         * Payout details otherwise live behind `PUT /pro/bank`, which needs the
+         * whole set — account name, number and IFSC — because a partial bank
+         * update is how money reaches a half-changed destination. A UPI id is
+         * self-contained and independently verifiable, so changing it alone is
+         * safe and is the one payout edit a pro can make from their profile.
+         *
+         * Ignored when there is no bank record yet: onboarding step 5 creates
+         * it, and writing `bank.upiId` into nothing would produce a payout
+         * destination with no account behind it.
+         */
+        ...(pro.bank && typeof (req.body as { upiId?: unknown })?.upiId === "string"
+          ? {
+              "bank.upiId": String((req.body as { upiId: string }).upiId).trim(),
+            }
+          : {}),
       },
     },
   );

@@ -72,6 +72,27 @@ adminSettingsRouter.patch(
       update[key] = v;
     }
 
+    /**
+     * The serviced pincodes. Six digits, de-duplicated, order preserved.
+     *
+     * Validated rather than trusted: a typo here silently makes a whole area
+     * unbookable, and nothing on screen would explain why.
+     */
+    if (Array.isArray(body["servicePincodes"])) {
+      const cleaned = (body["servicePincodes"] as unknown[])
+        .filter((v): v is string => typeof v === "string")
+        .map((v) => v.trim())
+        .filter((v) => v !== "");
+      const bad = cleaned.find((v) => !/^[1-9]\d{5}$/.test(v));
+      if (bad !== undefined) {
+        throw badRequest(
+          `"${bad}" is not an Indian pincode. Six digits, not starting zero.`,
+          "BAD_PINCODE",
+        );
+      }
+      update["servicePincodes"] = [...new Set(cleaned)];
+    }
+
     if (Array.isArray(body["serviceAreas"])) {
       update["serviceAreas"] = (body["serviceAreas"] as unknown[])
         .filter((a): a is string => typeof a === "string")

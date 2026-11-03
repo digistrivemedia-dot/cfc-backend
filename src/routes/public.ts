@@ -68,6 +68,18 @@ publicRouter.get("/service-areas", async (_req, res) => {
 });
 
 /**
+ * The pincodes CFC accepts bookings from. **The authority on coverage.**
+ *
+ * Public because a visitor deciding whether to sign up needs to know before
+ * they have an account, and the pro app's pincode picker reads the same list
+ * so a pro cannot claim a pincode the platform does not serve.
+ */
+publicRouter.get("/service-pincodes", async (_req, res) => {
+  const settings = await getSettings();
+  res.json(settings.servicePincodes);
+});
+
+/**
  * The catalogue, as a customer sees it.
  *
  * Every route here passes `activeOnly: true`. That single flag is the whole

@@ -1,4 +1,4 @@
-import { Booking, newCompletionOtp, type BookingDoc } from "../models/booking";
+import { Booking, newJobOtp, type BookingDoc } from "../models/booking";
 import { DispatchAlert, Offer, type OfferDoc } from "../models/offer";
 import { Pro, canReceiveOffers, ratingOf, type ProDoc } from "../models/pro";
 import { newId } from "../models/id";
@@ -90,9 +90,23 @@ async function selectPros(
     // pool, and alerting them for work they cannot take costs them a penalty.
     online: true,
     _id: { $nin: [...excluded] },
-    // A pro serves named areas; the booking has one. This is the filter doing
-    // the work of "nearby" while coordinates are unusable.
-    areas: booking.address.area,
+    /**
+     * Who covers this address.
+     *
+     * **Pincode first, area name as a fallback.** The name match was the only
+     * test before, and it is fragile in a way that only shows up against a real
+     * geocoder: OSM calls the area CFC knows as "Thillai Nagar" "Trichy Zone
+     * IV", so a booking there matched no pro at all and sat unassigned.
+     *
+     * The `areas` branch stays for pros who registered before pincodes existed
+     * and have not set any — dropping them from the pool overnight would be a
+     * silent outage for them and for every customer in their area. They move
+     * over as they set pincodes from their own profile.
+     */
+    $or: [
+      { pincodes: booking.address.pincode },
+      { pincodes: { $size: 0 }, areas: booking.address.area },
+    ],
   }).lean<ProDoc[]>();
 
   const usable = candidates.filter(canReceiveOffers);
@@ -235,7 +249,8 @@ export async function acceptOffer(
         proId,
         // Generated at assignment, but revealed to the customer only once the
         // pro is on the way — a code visible for days is a code that leaks.
-        completionOtp: newCompletionOtp(),
+        startOtp: newJobOtp(),
+        completionOtp: newJobOtp(),
       },
       $push: {
         events: { at: new Date(), label: "Professional assigned", actor: pro.name },
@@ -432,7 +447,12 @@ export async function assignManually(
   const claimed = await Booking.findOneAndUpdate(
     { _id: bookingId, status: "pending", proId: null },
     {
-      $set: { status: "assigned", proId, completionOtp: newCompletionOtp() },
+      $set: {
+        status: "assigned",
+        proId,
+        startOtp: newJobOtp(),
+        completionOtp: newJobOtp(),
+      },
       $push: {
         events: {
           at: new Date(),
@@ -465,4 +485,140 @@ export async function assignManually(
   );
 
   return { ok: true, booking: claimed };
+}
+
+/**
+ * Bookings nobody took, that this pro could.
+ *
+ * ## Why this exists
+ *
+ * A booking is offered for 30 seconds, and `selectPros` **excludes any pro
+ * already offered it** so an escalating round does not re-alert someone who
+ * declined. Sound, until the roster is small: with one eligible pro, their
+ * offer lapses, the next round finds nobody, and the booking sits `pending`
+ * with `proId: null` for ever. The admin gets an alert; the pro who could do
+ * the job has no way to take it.
+ *
+ * So this is the same filter dispatch uses, minus the exclusion: a lapsed or
+ * declined offer stops meaning "never" once the alternative is the job dying.
+ *
+ * ## Why the slot has to be in the future
+ *
+ * A pro claiming yesterday's 10am job cannot do it and the customer has long
+ * since given up. Those belong in the admin's alert queue to cancel or rebook,
+ * not in a list of work to take.
+ */
+export async function unclaimedFor(proId: string): Promise<BookingDoc[]> {
+  const pro = await Pro.findById(proId).lean<ProDoc>();
+  if (!pro || !canReceiveOffers(pro)) return [];
+
+  return Booking.find({
+    status: "pending",
+    proId: null,
+    // Only work this pro is approved for. The office approves skills, and a
+    // list that ignored that would let anyone claim anything.
+    serviceId: { $in: pro.serviceIds },
+    // Not yet due. `scheduledAt` in the past is a job that cannot be done.
+    scheduledAt: { $gt: new Date() },
+    // Pincode, with the area fallback for pros who have not set pincodes yet —
+    // the same rule the dispatch query uses, so the two never disagree about
+    // who covers an address.
+    $or: [
+      { "address.pincode": { $in: pro.pincodes } },
+      ...(pro.pincodes.length === 0
+        ? [{ "address.area": { $in: pro.areas } }]
+        : []),
+    ],
+  })
+    .sort({ scheduledAt: 1 })
+    .limit(50)
+    .lean<BookingDoc[]>();
+}
+
+/** Why a claim failed, in the caller's terms. */
+export type ClaimOutcome =
+  | { kind: "claimed"; booking: BookingDoc }
+  /** Another pro got there first, or dispatch assigned it. Not an error. */
+  | { kind: "taken" }
+  /** Not approved, blocked, wrong service, wrong area, or the slot has passed. */
+  | { kind: "ineligible" };
+
+/**
+ * Takes an unclaimed booking.
+ *
+ * **Online is deliberately not required.** Being online means "send me work";
+ * opening this list and tapping one job is the pro actively asking for that
+ * one, so the flag would be friction with no safety behind it. Approved and
+ * not blocked still apply, re-checked here rather than trusted from the list.
+ *
+ * The assignment is the same single atomic update `acceptOffer` uses, so a
+ * claim and an accept cannot produce two differently-shaped bookings — and two
+ * pros tapping at once is resolved by the database, not by a check that races.
+ */
+export async function claimBooking(
+  proId: string,
+  bookingId: string,
+): Promise<ClaimOutcome> {
+  const pro = await Pro.findById(proId).lean<ProDoc>();
+  if (!pro || !canReceiveOffers(pro)) return { kind: "ineligible" };
+
+  const booking = await Booking.findById(bookingId).lean<BookingDoc>();
+  if (!booking) return { kind: "ineligible" };
+  if (booking.proId !== null || booking.status !== "pending") {
+    return { kind: "taken" };
+  }
+  if (!pro.serviceIds.includes(booking.serviceId)) return { kind: "ineligible" };
+  if (booking.scheduledAt.getTime() <= Date.now()) return { kind: "ineligible" };
+
+  const covers =
+    pro.pincodes.length > 0
+      ? pro.pincodes.includes(booking.address.pincode)
+      : pro.areas.includes(booking.address.area);
+  if (!covers) return { kind: "ineligible" };
+
+  const claimed = await Booking.findOneAndUpdate(
+    { _id: bookingId, status: "pending", proId: null },
+    {
+      $set: {
+        status: "assigned",
+        proId,
+        startOtp: newJobOtp(),
+        completionOtp: newJobOtp(),
+      },
+      $push: {
+        events: {
+          at: new Date(),
+          // Named differently from a dispatched assignment on purpose: the
+          // timeline should show that nobody was sent this job, somebody took
+          // it. That is a different operational story.
+          label: "Professional claimed this job",
+          actor: pro.name,
+        },
+      },
+    },
+    { new: true },
+  ).lean<BookingDoc>();
+
+  if (!claimed) return { kind: "taken" };
+
+  // The admin was told this booking was stuck. It no longer is.
+  await DispatchAlert.deleteOne({ bookingId });
+
+  await notify({
+    role: "customer",
+    to: claimed.customerId,
+    kind: "booking",
+    title: `${pro.name} is on the way`,
+    body: `Your ${claimed.serviceName} booking ${claimed.reference} has been assigned.`,
+    href: `/bookings/${claimed.reference}`,
+  });
+
+  // Any offer this pro still holds for it is now spent rather than left
+  // sitting as "offered" against a booking that is assigned.
+  await Offer.updateMany(
+    { bookingId, status: "offered" },
+    { $set: { status: "taken", respondedAt: new Date() } },
+  );
+
+  return { kind: "claimed", booking: claimed };
 }

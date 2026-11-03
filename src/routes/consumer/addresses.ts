@@ -10,6 +10,7 @@ import { Booking } from "../../models/booking";
 import { newId } from "../../models/id";
 import { actorOf, requireAuth } from "../../middleware/auth";
 import { projectAddress } from "./auth";
+import { getSettings } from "../../models/settings";
 
 /**
  * Customer 16, 17 — saved addresses.
@@ -74,34 +75,59 @@ function readAddress(body: unknown, id: string): AddressSub {
   const lat = typeof point?.lat === "number" ? point.lat : 0;
   const lng = typeof point?.lng === "number" ? point.lng : 0;
 
+  // `other` is the only label a customer names themselves. A name sent with
+  // `home` is dropped rather than stored, so nothing can show "Home (Office)".
+  const labelName = label === "other" ? optionalStr(body, "labelName") : undefined;
+  if (label === "other" && labelName === undefined) {
+    throw badRequest("Name this address so you can tell it apart.", "MISSING_LABEL_NAME");
+  }
+
+  const optional = (field: string) => {
+    const v = optionalStr(body, field);
+    return v !== undefined ? { [field]: v } : {};
+  };
+
   return {
     id,
     label,
+    ...(labelName !== undefined ? { labelName } : {}),
+    ...optional("flatNumber"),
     line1: str(body, "line1", "Address line 1"),
-    ...(optionalStr(body, "line2") !== undefined
-      ? { line2: optionalStr(body, "line2") as string }
-      : {}),
-    ...(optionalStr(body, "landmark") !== undefined
-      ? { landmark: optionalStr(body, "landmark") as string }
-      : {}),
+    ...optional("line2"),
+    ...optional("landmark"),
     area: str(body, "area", "Area"),
     city: str(body, "city", "City"),
     state: str(body, "state", "State"),
     pincode,
+    ...optional("contactName"),
+    ...optional("contactPhone"),
     lat,
     lng,
-    // Always false for now: nothing geocodes yet, and the address form sends a
-    // hardcoded Bengaluru coordinate for every address. See the field's note on
-    // the Customer model — Phase 6 dispatch reads this to decide whether
-    // distance ordering means anything.
-    locationVerified: false,
+    /**
+     * True when the coordinates came from a real map pin.
+     *
+     * The caller says so explicitly rather than this being inferred from
+     * `lat`/`lng` being non-zero — a hardcoded constant is also non-zero, and
+     * that is exactly the bug this flag exists to distinguish. The address
+     * form now places a draggable pin on a Google map and sends what the
+     * customer confirmed, so this is finally true for new addresses.
+     *
+     * Phase 6 dispatch reads it to decide whether distance ordering means
+     * anything; older records stay false and fall back to area matching.
+     */
+    locationVerified:
+      (body as { locationVerified?: unknown })?.locationVerified === true &&
+      lat !== 0 &&
+      lng !== 0,
     isDefault: Boolean((body as { isDefault?: unknown })?.isDefault),
   };
 }
 
 consumerAddressRouter.get("/", async (req, res) => {
   const customer = await loadCustomer(actorOf(req).id);
-  res.json(customer.addresses.map(projectAddress));
+  // One settings read for the whole list, not one per address.
+  const { servicePincodes } = await getSettings();
+  res.json(customer.addresses.map((a) => projectAddress(a, servicePincodes)));
 });
 
 /**
@@ -143,7 +169,10 @@ consumerAddressRouter.put("/", async (req, res) => {
 
   const updated = await loadCustomer(customer._id);
   const saved = updated.addresses.find((a) => a.id === address.id);
-  res.status(isEdit ? 200 : 201).json(saved ? projectAddress(saved) : null);
+  const { servicePincodes } = await getSettings();
+  res
+    .status(isEdit ? 200 : 201)
+    .json(saved ? projectAddress(saved, servicePincodes) : null);
 });
 
 /**

@@ -9,6 +9,7 @@ import { walletBalance } from "../../models/wallet";
 import { newId } from "../../models/id";
 import { actorOf, requireAuth } from "../../middleware/auth";
 import { rateLimit } from "../../middleware/rate-limit";
+import { getSettings } from "../../models/settings";
 import { PUBLIC_PREFIX } from "../../uploads";
 
 /**
@@ -144,9 +145,10 @@ consumerAuthRouter.patch("/me", requireAuth, async (req, res) => {
  * interchangeable and a screen never has to merge two shapes of the same thing.
  */
 export async function projectProfile(customer: CustomerDoc) {
-  const [walletPaise, totalBookings] = await Promise.all([
+  const [walletPaise, totalBookings, { servicePincodes }] = await Promise.all([
     walletBalance(customer._id),
     Booking.countDocuments({ customerId: customer._id }),
+    getSettings(),
   ]);
 
   return {
@@ -160,15 +162,25 @@ export async function projectProfile(customer: CustomerDoc) {
     walletPaise,
     totalBookings,
     joinedAt: customer.createdAt.toISOString(),
-    addresses: customer.addresses.map(projectAddress),
+    addresses: customer.addresses.map((a) => projectAddress(a, servicePincodes)),
   };
 }
 
-/** One embedded address as the `Address` type the screens render. */
-export function projectAddress(a: AddressSub) {
+/**
+ * One address, as a customer's app sees it.
+ *
+ * `servicePincodes` is passed in rather than read here, so a list of addresses
+ * costs one settings read instead of one per address. Omitted leaves
+ * `serviceable` undefined, which the screens read as "not known" rather than
+ * as `false` — reporting an address unserviceable because nobody looked is the
+ * one wrong answer available.
+ */
+export function projectAddress(a: AddressSub, servicePincodes?: string[]) {
   return {
     id: a.id,
     label: a.label,
+    labelName: a.labelName,
+    flatNumber: a.flatNumber,
     line1: a.line1,
     line2: a.line2,
     landmark: a.landmark,
@@ -176,7 +188,22 @@ export function projectAddress(a: AddressSub) {
     city: a.city,
     state: a.state,
     pincode: a.pincode,
+    contactName: a.contactName,
+    contactPhone: a.contactPhone,
     point: { lat: a.lat, lng: a.lng },
+    locationVerified: a.locationVerified,
+    /**
+     * Whether CFC operates here — **by pincode, not by area name.**
+     *
+     * The name test was wrong in a way that only shows up with a real
+     * geocoder: OSM returns the area CFC calls "Thillai Nagar" as "Trichy Zone
+     * IV", so an address inside a serviced area read as unserviceable. A
+     * pincode is official, fixed, and comes back identically from every
+     * provider.
+     */
+    ...(servicePincodes
+      ? { serviceable: servicePincodes.includes(a.pincode.trim()) }
+      : {}),
     isDefault: a.isDefault,
   };
 }

@@ -28,6 +28,21 @@ export interface SettingsDoc {
   serviceAreas: string[];
 
   /**
+   * The pincodes CFC will accept a booking from. **The authority on coverage.**
+   *
+   * Area *names* were the test before this, and they were the wrong unit: the
+   * name has to survive a round trip through a geocoder, and OSM returns the
+   * area CFC calls "Thillai Nagar" as "Trichy Zone IV" — so an address in a
+   * serviced area read as unserviceable. A pincode is a fixed, official
+   * identifier that every geocoder returns the same way and every customer
+   * already knows.
+   *
+   * `serviceAreas` stays, for labels, filters and the registration list. It is
+   * no longer what decides whether a booking is allowed.
+   */
+  servicePincodes: string[];
+
+  /**
    * How far ahead a customer may book, in days.
    *
    * §7.2 lists this as a guess — the agreement does not state it. Config rather
@@ -125,6 +140,7 @@ const settingsSchema = new Schema<SettingsDoc>(
   {
     _id: { type: String, default: "platform" },
     serviceAreas: { type: [String], default: [] },
+    servicePincodes: { type: [String], default: [] },
     bookingHorizonDays: { type: Number, default: 30 },
     slotMinutes: { type: Number, default: 120 },
     slotStartHour: { type: Number, default: 8 },
@@ -175,6 +191,7 @@ export async function getSettings(): Promise<SettingsDoc> {
   return {
     _id: SETTINGS_ID,
     serviceAreas: doc?.serviceAreas ?? [],
+    servicePincodes: doc?.servicePincodes ?? [],
     bookingHorizonDays: doc?.bookingHorizonDays ?? 30,
     slotMinutes: doc?.slotMinutes ?? 120,
     supportPhone: doc?.supportPhone ?? "",

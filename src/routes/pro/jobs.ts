@@ -11,10 +11,20 @@ import { Service, type ServiceDoc } from "../../models/catalog";
 import {
   OFFER_WINDOW_SECONDS,
   acceptOffer,
+  claimBooking,
   declineOffer,
+  unclaimedFor,
 } from "../../services/dispatch";
-import { PUBLIC_PREFIX } from "../../uploads";
-import { imageUpload, verifyImageBytes } from "../../middleware/upload";
+import { PUBLIC_PREFIX, PUBLIC_ROOT } from "../../uploads";
+import {
+  MAX_JOB_IMAGE_BYTES,
+  MAX_VIDEO_BYTES,
+  formatBytes,
+  isVideoPath,
+  mediaUpload,
+  verifyImageBytes,
+  verifyVideoBytes,
+} from "../../middleware/upload";
 import {
   addExtraCharge,
   completeJob,
@@ -156,8 +166,20 @@ function projectJob(
 
     // Shown to the pro only once they are on site — it is the customer's code
     // to give, not the pro's to hold in advance.
-    completionOtp:
-      released && booking.status === "in_progress" ? booking.completionOtp : null,
+    /**
+     * **Never sent to the professional.** Always null.
+     *
+     * It used to be released once the job was `in_progress`, which handed the
+     * pro the very code the customer is supposed to read out — so a pro could
+     * open devtools, read the response, and close a job they had not done with
+     * nobody present. The whole point of the code is that only the customer
+     * has it.
+     *
+     * The server compares it. The field stays in the shape so the pro app's
+     * screens keep their types, and so anything reading it gets a null rather
+     * than a stale value.
+     */
+    completionOtp: null,
 
     checklist: options.checklist,
     beforePhotoUrls: booking.beforePhotoPaths.map((p) => `${PUBLIC_PREFIX}/${p}`),
@@ -347,6 +369,64 @@ proJobsRouter.get("/jobs", async (req, res) => {
   res.json(jobs);
 });
 
+/**
+ * Pro 13b — bookings nobody accepted, that this pro could take.
+ *
+ * **Registered before `/jobs/:id`.** Express matches in order, so the other way
+ * round a request for `/jobs/unclaimed` is read as a request for the job whose
+ * id is "unclaimed" and answers 404.
+ *
+ * Shown with the customer's identity **withheld**, exactly like an offer: this
+ * pro has not been assigned the job yet, and a list anyone eligible can read is
+ * not a place to publish an address and a phone number.
+ */
+proJobsRouter.get("/jobs/unclaimed", async (req, res) => {
+  const pro = await loadPro(actorOf(req).id);
+  const rows = await unclaimedFor(pro._id);
+
+  const jobs = await Promise.all(
+    rows.map(async (b) =>
+      projectJob(b, pro, {
+        // Not theirs yet. The address and phone are released on claiming.
+        released: false,
+        offered: true,
+        distanceKm: null,
+        checklist: await checklistFor(b.serviceId),
+      }),
+    ),
+  );
+
+  res.json(jobs);
+});
+
+/**
+ * Takes one.
+ *
+ * A refusal is a **200 with `kind`**, not an error status: "another
+ * professional got there first" is the documented rule working, and the screen
+ * renders it as a real outcome rather than a failure.
+ */
+proJobsRouter.post("/jobs/:id/claim", async (req, res) => {
+  const pro = await loadPro(actorOf(req).id);
+  const result = await claimBooking(pro._id, param(req, "id"));
+
+  if (result.kind !== "claimed") {
+    res.json({ kind: result.kind });
+    return;
+  }
+
+  res.json({
+    kind: "claimed",
+    job: projectJob(result.booking, pro, {
+      // Theirs now, so the customer's details are released.
+      released: true,
+      offered: false,
+      distanceKm: null,
+      checklist: await checklistFor(result.booking.serviceId),
+    }),
+  });
+});
+
 proJobsRouter.get("/jobs/counts", async (req, res) => {
   const pro = await loadPro(actorOf(req).id);
   const rows = await Booking.find({ proId: pro._id })
@@ -358,6 +438,9 @@ proJobsRouter.get("/jobs/counts", async (req, res) => {
     upcoming: rows.filter((r) => r.status === "assigned").length,
     completed: rows.filter((r) => r.status === "completed").length,
     cancelled: rows.filter((r) => r.status === "cancelled").length,
+    // Not this pro's bookings at all — work going begging that they could take.
+    // Counted here so the tab can carry a badge without a second request.
+    unclaimed: (await unclaimedFor(pro._id)).length,
   });
 });
 
@@ -423,8 +506,21 @@ proJobsRouter.get("/jobs/:id", async (req, res) => {
 /** Pro 15 — arrived, starting work. `assigned → in_progress`. */
 proJobsRouter.post("/jobs/:id/start", async (req, res) => {
   const pro = await loadPro(actorOf(req).id);
-  const result = await startJob(pro._id, req.params.id);
-  if (!result.ok) throw conflict(result.reason, "BAD_TRANSITION");
+
+  const otp = (req.body as { otp?: unknown })?.otp;
+  if (typeof otp !== "string") {
+    throw badRequest("Enter the code the customer gives you.", "MISSING_OTP");
+  }
+
+  const result = await startJob(pro._id, req.params.id, otp);
+  if (!result.ok) {
+    // A wrong code is the customer reading out the wrong number, not a bad
+    // transition — distinguished so the screen can mark the field instead of
+    // telling the pro the job cannot be started.
+    throw result.wrongOtp
+      ? badRequest(result.reason, "WRONG_OTP")
+      : conflict(result.reason, "BAD_TRANSITION");
+  }
 
   res.json(
     projectJob(result.booking, pro, {
@@ -448,21 +544,95 @@ proJobsRouter.post("/jobs/:id/start", async (req, res) => {
  */
 proJobsRouter.post(
   "/jobs/:id/photos",
-  imageUpload.single("file"),
+  mediaUpload.single("file"),
   async (req, res) => {
     const pro = await loadPro(actorOf(req).id);
     const stage = (req.body as { stage?: unknown })?.stage;
 
-    if (stage !== "before" && stage !== "after") {
+    const discard = async () => {
       if (req.file) await fsPromises.unlink(req.file.path).catch(() => {});
+    };
+
+    if (stage !== "before" && stage !== "after") {
+      await discard();
       throw badRequest("Say whether this is a before or after photo.", "BAD_STAGE");
     }
     if (!req.file) throw badRequest("No file was uploaded.", "NO_FILE");
 
-    const ok = await verifyImageBytes(req.file.path);
-    if (!ok) {
-      await fsPromises.unlink(req.file.path).catch(() => {});
-      throw badRequest("That file is not a valid image.", "BAD_FILE_TYPE");
+    // Multer streams to disk before handing over, so every rejection below has
+    // to clean up after itself.
+    const video = isVideoPath(req.file.path);
+    const valid = video
+      ? await verifyVideoBytes(req.file.path)
+      : await verifyImageBytes(req.file.path);
+    if (!valid) {
+      await discard();
+      throw badRequest(
+        video
+          ? "That file is not a valid video. MP4, MOV or WebM."
+          : "That file is not a valid image. JPG, PNG or WebP.",
+        "BAD_FILE_TYPE",
+      );
+    }
+
+    if (video) {
+      if (req.file.size > MAX_VIDEO_BYTES) {
+        await discard();
+        throw badRequest(
+          `That video is ${formatBytes(req.file.size)}. The limit is ` +
+            `${formatBytes(MAX_VIDEO_BYTES)} — record a shorter clip or use ` +
+            `your phone's lower video quality setting.`,
+          "VIDEO_TOO_LARGE",
+        );
+      }
+    } else {
+      /**
+       * The image budget is for the **whole job**, not per file.
+       *
+       * So the existing photos have to be measured, not assumed: eight files
+       * that each passed a per-file check can still blow a job budget. The
+       * error names every photo and its size, because "too large" when a pro
+       * is nine files deep tells them nothing about which one to drop.
+       */
+      const existing = await Booking.findOne({
+        _id: req.params.id,
+        proId: pro._id,
+      })
+        .select({ beforePhotoPaths: 1, afterPhotoPaths: 1 })
+        .lean<Pick<BookingDoc, "beforePhotoPaths" | "afterPhotoPaths">>();
+
+      const kept = [
+        ...(existing?.beforePhotoPaths ?? []),
+        ...(existing?.afterPhotoPaths ?? []),
+      ];
+
+      const sizes: { name: string; bytes: number }[] = [];
+      for (const name of kept) {
+        if (isVideoPath(name)) continue; // videos have their own limit
+        try {
+          const stat = await fsPromises.stat(nodePath.join(PUBLIC_ROOT, name));
+          sizes.push({ name, bytes: stat.size });
+        } catch {
+          // Missing file: it cannot be using disk, so it cannot count.
+        }
+      }
+
+      const used = sizes.reduce((sum, f) => sum + f.bytes, 0);
+      if (used + req.file.size > MAX_JOB_IMAGE_BYTES) {
+        const listed = sizes
+          .map((f, i) => `photo ${i + 1}: ${formatBytes(f.bytes)}`)
+          .join(", ");
+        await discard();
+        throw badRequest(
+          `Your photos for this job would come to ` +
+            `${formatBytes(used + req.file.size)}, over the ` +
+            `${formatBytes(MAX_JOB_IMAGE_BYTES)} limit. ` +
+            `This one is ${formatBytes(req.file.size)}` +
+            (listed ? `, and the rest are — ${listed}.` : ".") +
+            ` Remove one, or add a shorter video instead.`,
+          "IMAGES_TOO_LARGE",
+        );
+      }
     }
 
     const filename = nodePath.basename(req.file.path);
@@ -484,7 +654,7 @@ proJobsRouter.post(
     if (!updated) {
       await fsPromises.unlink(req.file.path).catch(() => {});
       throw conflict(
-        "Photos can only be added to a job that is under way.",
+        "Proof can only be added to a job that is under way.",
         "BAD_STATE",
       );
     }
@@ -492,6 +662,9 @@ proJobsRouter.post(
     res.status(201).json({
       stage,
       url: `${PUBLIC_PREFIX}/${filename}`,
+      /** So the screen can render a player rather than a broken `<img>`. */
+      kind: video ? "video" : "image",
+      bytes: req.file.size,
       beforeCount: updated.beforePhotoPaths.length,
       afterCount: updated.afterPhotoPaths.length,
     });

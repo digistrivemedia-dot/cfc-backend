@@ -98,6 +98,19 @@ export interface ProDoc {
    */
   areas: string[];
 
+  /**
+   * The pincodes this pro will travel to. What dispatch matches on.
+   *
+   * Separate from `areas`, which stays for display. A pro covering "Srirangam"
+   * may serve two pincodes or half of one, and an area name cannot express
+   * that — nor survive a geocoder renaming it.
+   *
+   * Empty on every pro registered before this existed, so dispatch falls back
+   * to the area match for them rather than removing them from the pool
+   * overnight. They set pincodes from their own profile.
+   */
+  pincodes: string[];
+
   bio: string;
   experienceYears: number;
   photoPath?: string;
@@ -193,6 +206,7 @@ const proSchema = new Schema<ProDoc>(
       default: undefined,
     },
     areas: { type: [String], default: [] },
+    pincodes: { type: [String], default: [], index: true },
     bio: { type: String, default: "", trim: true },
     experienceYears: { type: Number, default: 0 },
     photoPath: { type: String },

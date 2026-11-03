@@ -101,6 +101,47 @@ export const env = {
   uploadRoot,
 
   /**
+   * Server-side Google Maps key, for reverse geocoding.
+   *
+   * **Separate from the browser key on purpose.** The Maps JavaScript key ships
+   * in the page and cannot be hidden, so it is restricted by HTTP referrer and
+   * limited to Maps + Places. Geocoding is called from here instead, with a key
+   * restricted by IP that never reaches a browser — otherwise anyone reading
+   * devtools can spend the geocoding quota.
+   *
+   * Optional: without it `/consumer/geocode/reverse` answers 503 and the
+   * address form falls back to typed entry rather than the whole app failing to
+   * boot over a key that is not needed to browse.
+   */
+  mapsServerKey: optional("GOOGLE_MAPS_SERVER_KEY", ""),
+
+  /**
+   * Which geocoder turns a map pin into an address: `osm` or `google`.
+   *
+   * **Defaults to `osm`, which needs no key and costs nothing.** Google's
+   * Geocoding API requires an activated billing account — in India that means a
+   * ₹1,000 prepayment before a single request is served — so it is not the
+   * default, only an option.
+   *
+   * Switching is this one value plus a restart. Both implementations return the
+   * identical shape, so nothing above them changes.
+   */
+  geocoder: optional("GEOCODER", "osm"),
+
+  /**
+   * Geoapify key, for the OSM geocoder.
+   *
+   * Optional. Without it the OSM provider calls public Nominatim, which is free
+   * and needs no signup but is rate-limited to roughly one request a second and
+   * whose policy does not cover commercial use. With it, the same provider uses
+   * Geoapify's free tier instead: proper terms, no ban risk, still no card.
+   *
+   * Free key: https://myprojects.geoapify.com — sign up, create a project,
+   * copy the API key.
+   */
+  geoapifyKey: optional("GEOAPIFY_API_KEY", ""),
+
+  /**
    * Browser origins allowed to call the API. The three Next apps in dev.
    *
    * An allowlist rather than `*` from the first commit: these endpoints carry

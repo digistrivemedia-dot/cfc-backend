@@ -566,6 +566,7 @@ function projectBooking(b: BookingDoc) {
     // Filled in by `attachPro`. Null while dispatch is still looking, which
     // the screens already render as "finding a professional".
     pro: null as AssignedPro | null,
+    startOtp: b.startOtp,
     completionOtp: b.completionOtp,
     // Filled in by `attachPro`, which has the pro's last ping.
     etaMinutes: null as number | null,
@@ -609,6 +610,7 @@ interface AssignedPro {
 async function attachPro<
   T extends {
     status: string;
+    startOtp: string | null;
     completionOtp: string | null;
     proPoint: { lat: number; lng: number } | null;
     proPosition: { x: number; y: number } | null;
@@ -620,7 +622,7 @@ async function attachPro<
 ): Promise<T[]> {
   const proIds = [...new Set(bookings.map((b) => b.proId).filter(Boolean))];
   if (proIds.length === 0) {
-    return rows.map((r) => ({ ...r, completionOtp: null }));
+    return rows.map((r) => ({ ...r, startOtp: null, completionOtp: null }));
   }
 
   const pros = await Pro.find({ _id: { $in: proIds } }).lean<ProDoc[]>();
@@ -654,6 +656,15 @@ async function attachPro<
             jobsCompleted: pro.jobsCompleted,
           }
         : null,
+      /**
+       * Released as soon as a professional is assigned, unlike the completion
+       * code which waits until they are on the way.
+       *
+       * The start code is the first thing that happens at the door, and a
+       * customer hunting for it while somebody stands waiting is worse than it
+       * sitting on their booking screen for a day.
+       */
+      startOtp: booking?.startOtp ?? null,
       completionOtp: onTheWay ? (booking?.completionOtp ?? null) : null,
       proPoint: track?.proPoint ?? null,
       proPosition: track?.proPosition ?? null,
@@ -823,6 +834,7 @@ consumerBookingRouter.post("/:id/cancel", async (req, res) => {
       $set: {
         status: "cancelled",
         // A code for a job that is not happening is a code that leaks.
+        startOtp: null,
         completionOtp: null,
       },
       $push: {

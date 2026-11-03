@@ -1011,6 +1011,54 @@ async function checkProOnboarding(
       assert.equal(photoAfter.bio, "Twelve years on ACs.");
     });
 
+    // -- a booking nobody accepted stays claimable ---------------------------
+    //
+    // A 30-second offer that lapses leaves the booking `pending` with no pro,
+    // and `selectPros` excludes anyone already offered it — so with a small
+    // roster the booking has nobody left to ask and sat for ever. This is the
+    // way out of that.
+    const unclaimed = await get("/pro/jobs/unclaimed", proToken);
+    check("the open-jobs list answers for an approved pro", () => {
+      assert.equal(unclaimed.status, 200);
+    });
+    const unclaimedRows = (await unclaimed.json()) as Record<string, unknown>[];
+    check("open jobs withhold the customer until claimed", () => {
+      // Every eligible pro can read this list, so it is not a place to publish
+      // somebody's address and phone number.
+      for (const row of unclaimedRows) {
+        assert.ok(!row["customerPhone"], "an open job leaked a phone number");
+      }
+    });
+
+    const claimMissing = await json(
+      "/pro/jobs/bkg_does_not_exist/claim",
+      {},
+      proToken,
+      "POST",
+    );
+    const claimBody = (await claimMissing.json()) as { kind?: string };
+    check("claiming a booking that is gone is reported, not thrown", () => {
+      // "Someone got there first" is the rule working. A 500 would make a
+      // normal race look like a fault.
+      assert.equal(claimMissing.status, 200);
+      assert.ok(
+        claimBody.kind === "taken" || claimBody.kind === "ineligible",
+        `expected taken/ineligible, got ${claimBody.kind}`,
+      );
+    });
+
+    const proPins = await json(
+      "/pro/profile/pincodes",
+      { pincodes: ["110001"] },
+      proToken,
+      "PUT",
+    );
+    check("a pro cannot claim a pincode the platform does not serve", () => {
+      // Dispatch would never send them a booking there, so the screen would be
+      // promising work that cannot arrive.
+      assert.equal(proPins.status, 400);
+    });
+
     // The pro's own profile screen reads this. It used to call
     // `GET /admin/pros/:id` — an admin route — and got a 403 on every load,
     // which it reported to the pro as a connection problem.
@@ -1441,6 +1489,160 @@ async function checkBooking(
       assert.equal(addr.status, 201);
       assert.equal(addrBody.isDefault, true);
     });
+
+    // -- the map-backed address form ---------------------------------------
+    //
+    // Every address used to be saved with a hardcoded Bengaluru coordinate and
+    // `locationVerified: false`. The form now places a real pin, and these are
+    // the fields and rules that came with it.
+    const fullAddr = await call("PUT", "/consumer/addresses", {
+      label: "other", labelName: "Mum's place", flatNumber: "3B",
+      line1: "12 Cauvery Street", landmark: "Opposite the school",
+      area: "Srirangam", city: "Tiruchirappalli", state: "Tamil Nadu",
+      pincode: "620006", contactName: "Lakshmi", contactPhone: "9876543210",
+      point: { lat: 10.8605, lng: 78.6855 }, locationVerified: true,
+    }, custToken);
+    const fullBody = (await fullAddr.json()) as Record<string, unknown>;
+    check("an address keeps its contact, flat number and custom label", () => {
+      assert.equal(fullAddr.status, 201);
+      assert.equal(fullBody["labelName"], "Mum's place");
+      assert.equal(fullBody["flatNumber"], "3B");
+      assert.equal(fullBody["contactName"], "Lakshmi");
+      assert.equal(fullBody["contactPhone"], "9876543210");
+    });
+
+    check("a confirmed map pin is recorded as verified", () => {
+      // Phase 6 dispatch reads this to decide whether distance ordering means
+      // anything. False for every older record, and now true for new ones.
+      assert.equal(fullBody["locationVerified"], true);
+      assert.equal(fullBody["serviceable"], true);
+    });
+
+    const unnamed = await call("PUT", "/consumer/addresses", {
+      label: "other", line1: "1 Somewhere", area: "Srirangam",
+      city: "Tiruchirappalli", state: "Tamil Nadu", pincode: "620006",
+      point: { lat: 10.86, lng: 78.68 },
+    }, custToken);
+    check("an 'other' address must be named", () => {
+      // Two addresses both reading "Other" cannot be told apart in a picker.
+      assert.equal(unnamed.status, 400);
+    });
+
+    const faked = await call("PUT", "/consumer/addresses", {
+      label: "work", line1: "2 Elsewhere", area: "Srirangam",
+      city: "Tiruchirappalli", state: "Tamil Nadu", pincode: "620006",
+      point: { lat: 0, lng: 0 }, locationVerified: true,
+    }, custToken);
+    const fakedBody = (await faked.json()) as Record<string, unknown>;
+    check("a null coordinate cannot claim to be verified", () => {
+      // The flag exists to distinguish a real pin from a placeholder, so a
+      // caller asserting it over 0,0 must not be believed.
+      assert.equal(fakedBody["locationVerified"], false);
+    });
+
+    // -- coverage is decided by PINCODE, not by area name ------------------
+    //
+    // The whole reason this changed: OSM returns the area CFC calls "Thillai
+    // Nagar" as "Trichy Zone IV", so a name match made a serviced address
+    // unbookable. A pincode survives the round trip through any geocoder.
+    await call("PATCH", "/admin/settings", { servicePincodes: ["620006"] }, adminToken);
+
+    const renamed = await call("PUT", "/consumer/addresses", {
+      label: "home", line1: "9 Renamed Road", area: "Trichy Zone IV",
+      city: "Tiruchirappalli", state: "Tamil Nadu", pincode: "620006",
+      point: { lat: 10.86, lng: 78.69 }, locationVerified: true,
+    }, custToken);
+    const renamedBody = (await renamed.json()) as Record<string, unknown>;
+    check("an area name the geocoder renamed is still serviceable", () => {
+      assert.equal(renamedBody["serviceable"], true);
+    });
+
+    const badPincode = await call(
+      "PATCH", "/admin/settings", { servicePincodes: ["62000"] }, adminToken,
+    );
+    check("the admin cannot save a malformed pincode", () => {
+      // A typo here silently makes a whole area unbookable with nothing on
+      // screen to explain it.
+      assert.equal(badPincode.status, 400);
+    });
+
+    const outside = await call("PUT", "/consumer/addresses", {
+      label: "home", line1: "5 MG Road", area: "Koramangala",
+      city: "Bengaluru", state: "Karnataka", pincode: "560034",
+      point: { lat: 12.9352, lng: 77.6245 }, locationVerified: true,
+    }, custToken);
+    const outsideBody = (await outside.json()) as Record<string, unknown>;
+    check("an address outside every service area saves but is not serviceable", () => {
+      // Saved, because losing something a customer carefully typed is worse
+      // than holding an address we cannot serve yet. The booking screen reads
+      // `serviceable` and refuses with the reason named.
+      assert.equal(outside.status, 201);
+      assert.equal(outsideBody["serviceable"], false);
+    });
+
+    // A real coordinate in Srirangam, through whichever geocoder `GEOCODER`
+    // selects. Under the default `osm` this reaches public Nominatim and needs
+    // no key of any kind.
+    const geo = await call(
+      "GET",
+      "/consumer/geocode/reverse?lat=10.8624&lng=78.6942",
+      undefined,
+      custToken,
+    );
+    const geoBody = (await geo.json()) as Record<string, unknown>;
+    check("reverse geocoding answers, or says why not", () => {
+      // 503 is a legitimate outcome: the provider is unreachable or unset, and
+      // the form falls back to typed entry. Anything else is a fault.
+      assert.ok(
+        geo.status === 200 || geo.status === 503,
+        `expected 200 or 503, got ${geo.status}`,
+      );
+    });
+
+    if (geo.status === 200) {
+      check("the locality is matched against the real service areas", () => {
+        /**
+         * The reason `pickArea` exists.
+         *
+         * OSM returns this Srirangam point as `suburb: "Trichy Zone IV"` with
+         * `county: "Srirangam"`. Reading the first field would store an area
+         * that matches no pro while looking entirely plausible, and the
+         * booking would sit unassigned. The route picks whichever candidate
+         * names a service area.
+         */
+        assert.equal(geoBody["area"], "Srirangam");
+        assert.equal(geoBody["serviceable"], true);
+      });
+
+      check("the street line is never blank when a point resolves", () => {
+        /**
+         * `road` is absent more often than you would expect.
+         *
+         * A pin on a street returns `road: "Uthirai street"`, but a pin in the
+         * middle of a block returns no road at all — only a ward name. Leaving
+         * `line1` empty there left the customer staring at an empty required
+         * box with nothing explaining why, so the provider falls back through
+         * the building name, the neighbourhood, and finally the most specific
+         * part of the display name.
+         */
+        assert.ok(
+          String(geoBody["line1"] ?? "").trim() !== "",
+          "line1 was empty for a point that resolved",
+        );
+      });
+
+      check("the geocoder never invents a field it does not know", () => {
+        // Empty beats a plausible guess: the form reads empty as "type it
+        // yourself", and a wrong street is worse than a blank one.
+        for (const field of ["line1", "city", "state", "pincode"]) {
+          assert.equal(
+            typeof geoBody[field],
+            "string",
+            `${field} should always be a string`,
+          );
+        }
+      });
+    }
 
     const staleEdit = await call("PUT", "/consumer/addresses", {
       id: "addr_gone", label: "home", line1: "x", area: "Srirangam",
@@ -2055,8 +2257,17 @@ async function checkDispatch(
       assert.ok(booking?.proId);
     });
 
-    check("a completion OTP is generated at assignment", () => {
-      assert.match(booking?.completionOtp ?? "", /^\d{6}$/);
+    check("both job codes are generated at assignment, four digits each", () => {
+      // Four, not six: the code is read aloud at a doorstep and typed into a
+      // four-box field. The server generated six, so the pro's field would not
+      // accept the fifth digit and no job could be completed from the app.
+      assert.match(booking?.startOtp ?? "", /^\d{4}$/);
+      assert.match(booking?.completionOtp ?? "", /^\d{4}$/);
+      assert.notEqual(
+        booking?.startOtp,
+        booking?.completionOtp,
+        "the two codes must differ, or starting would also complete",
+      );
     });
 
     const winnerId = booking?.proId ?? "";
@@ -2077,6 +2288,7 @@ async function checkDispatch(
       await call("GET", `/consumer/bookings/${bk.reference}`, undefined, custToken)
     ).json()) as {
       pro?: { name?: string; phone?: string; rating?: number } | null;
+      startOtp?: string | null;
       completionOtp?: string | null;
     };
 
@@ -2085,8 +2297,15 @@ async function checkDispatch(
       assert.ok(tracked.pro?.phone, "no phone for the assigned pro");
     });
 
-    check("the customer's completion OTP is released once a pro is assigned", () => {
-      assert.match(tracked.completionOtp ?? "", /^\d{6}$/);
+    check("the customer gets the start code at assignment", () => {
+      // Released immediately, unlike the completion code: the start code is
+      // the first thing that happens at the door, and a customer hunting for
+      // it while somebody waits is worse than it sitting on their screen.
+      assert.match(tracked.startOtp ?? "", /^\d{4}$/);
+    });
+
+    check("the customer's completion code is released once a pro is assigned", () => {
+      assert.match(tracked.completionOtp ?? "", /^\d{4}$/);
     });
 
     const leaked = JSON.stringify(tracked);
@@ -2391,6 +2610,7 @@ async function checkLifecycle(
     const booking = await Booking.findOne({ reference: bk.reference }).lean();
     bookingId = booking?._id ?? "";
     const realOtp = booking?.completionOtp ?? "";
+    const realStartOtp = booking?.startOtp ?? "";
 
     // -- the OTP is not shown to the pro before they are on site ------------
     const assignedJob = (await (
@@ -2411,12 +2631,30 @@ async function checkLifecycle(
     });
 
     // -- start --------------------------------------------------------------
-    const started = await call("POST", `/pro/jobs/${bookingId}/start`, {}, proToken);
-    check("the pro can start the job", () => {
+    const wrongStart = await call(
+      "POST", `/pro/jobs/${bookingId}/start`, { otp: "0000" }, proToken,
+    );
+    check("starting with the wrong code is refused", () => {
+      // The gate: a job used to start on the pro's word alone, with nothing
+      // connecting the clock to the customer actually being there.
+      assert.equal(wrongStart.status, 400);
+    });
+
+    const stillAssigned = await Booking.findById(bookingId).lean();
+    check("a wrong code does not advance the job", () => {
+      assert.equal(stillAssigned?.status, "assigned");
+    });
+
+    const started = await call(
+      "POST", `/pro/jobs/${bookingId}/start`, { otp: realStartOtp }, proToken,
+    );
+    check("the pro can start the job with the customer's code", () => {
       assert.equal(started.status, 200);
     });
 
-    const twice = await call("POST", `/pro/jobs/${bookingId}/start`, {}, proToken);
+    const twice = await call(
+      "POST", `/pro/jobs/${bookingId}/start`, { otp: realStartOtp }, proToken,
+    );
     check("starting twice is refused by the state machine", () => {
       assert.equal(twice.status, 409);
     });
@@ -2424,10 +2662,17 @@ async function checkLifecycle(
     const onSite = (await (
       await call("GET", `/pro/jobs/${bookingId}`, undefined, proToken)
     ).json()) as { completionOtp?: string | null };
-    check("the OTP is still withheld from the pro on site", () => {
-      // The pro has to be *told* it by the customer. Showing it to them would
-      // make the whole confirmation theatre.
-      assert.equal(onSite.completionOtp, realOtp);
+    check("the completion code is withheld from the pro on site", () => {
+      /**
+       * This asserted `=== realOtp` — that the code **is** shown to the pro —
+       * under a name saying it was withheld, with a comment explaining that
+       * showing it "would make the whole confirmation theatre". The name and
+       * the comment were right; the assertion was not.
+       *
+       * A pro who can read the code from the response can close a job with
+       * nobody present. The server compares it; the pro never receives it.
+       */
+      assert.equal(onSite.completionOtp, null);
     });
 
     // -- the gate, violation by violation ------------------------------------
@@ -3366,7 +3611,12 @@ async function checkQuotations(
       assert.equal(beforeStart.error?.reason, "bad-state");
     });
 
-    await call("POST", `/pro/jobs/${bookingId}/start`, {}, proToken);
+    await call(
+      "POST",
+      `/pro/jobs/${bookingId}/start`,
+      { otp: booking?.startOtp ?? "" },
+      proToken,
+    );
 
     const noPhotos = (await (
       await call("POST", `/pro/jobs/${bookingId}/quotation`, {
@@ -3695,7 +3945,12 @@ async function checkQuotations(
 
     const booking2 = await Booking.findOne({ reference: bk2.reference }).lean();
     const bookingId2 = booking2?._id ?? "";
-    await call("POST", `/pro/jobs/${bookingId2}/start`, {}, proToken);
+    await call(
+      "POST",
+      `/pro/jobs/${bookingId2}/start`,
+      { otp: booking2?.startOtp ?? "" },
+      proToken,
+    );
     await upload(`/pro/jobs/${bookingId2}/photos`, { stage: "before" }, proToken);
     await upload(`/pro/jobs/${bookingId2}/photos`, { stage: "before" }, proToken);
 
@@ -3911,7 +4166,12 @@ async function checkEarnings(
 
       const booking = await Booking.findOne({ reference: bk.reference }).lean();
       const id = booking?._id ?? "";
-      await call("POST", `/pro/jobs/${id}/start`, {}, proToken);
+      await call(
+        "POST",
+        `/pro/jobs/${id}/start`,
+        { otp: booking?.startOtp ?? "" },
+        proToken,
+      );
       await upload(`/pro/jobs/${id}/photos`, { stage: "after" }, proToken);
       const done = (await (
         await call("POST", `/pro/jobs/${id}/complete`, {
