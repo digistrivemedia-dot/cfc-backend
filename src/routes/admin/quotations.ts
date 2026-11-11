@@ -9,7 +9,7 @@ import {
 } from "../../middleware/auth";
 import { Quotation, type MaterialLineSub, type QuotationDoc } from "../../models/quotation";
 import { audit } from "../../models/audit";
-import { decideQuotation, sweepQuotations } from "../../services/quotation";
+import { cancelQuotation, editQuotation } from "../../services/quotation";
 import { PUBLIC_PREFIX } from "../../uploads";
 import { param } from "../../params";
 
@@ -55,9 +55,7 @@ function toDetail(q: QuotationDoc): QuotationDetail & {
   submittedTotalPaise: number;
   submittedMaterials: MaterialLineSub[];
   submittedLabourPaise: number;
-  advancePaise: number;
-  balancePaise: number;
-  advancePaid: boolean;
+  workStarted: boolean;
 } {
   return {
     ...toListItem(q),
@@ -88,16 +86,13 @@ function toDetail(q: QuotationDoc): QuotationDetail & {
     submittedLabourPaise: q.submittedLabourPaise,
 
     /**
-     * The 50% split the approval commits the customer to.
+     * Whether the customer's code has been entered and the quoted work began.
      *
-     * Returned to the admin as well as the customer: approving is the moment
-     * the advance is fixed, and an operator who just edited the figures should
-     * see what the customer will actually be asked to pay rather than working
-     * it out in their head.
+     * An operator handling a dispute needs this: "approved" and "the customer
+     * accepted" are both true of work that never started, and the money for it
+     * is in the pro's settlement either way.
      */
-    advancePaise: q.advancePaise,
-    balancePaise: q.balancePaise,
-    advancePaid: q.advancePaid,
+    workStarted: q.workStartedAt !== undefined,
   };
 }
 
@@ -122,7 +117,25 @@ adminQuotationsRouter.get("/", async (req, res) => {
     .sort({ status: 1, decisionBy: 1, createdAt: -1 })
     .lean<QuotationDoc[]>();
 
-  res.json(rows.map(toListItem));
+  /**
+   * **Detail rows, not list rows.**
+   *
+   * The queue is not a table: Admin 4 puts Approve, Edit & Approve and Reject
+   * *on the row*, so the row itself renders the material list and the
+   * photo-count badge — an operator with four minutes left should not spend
+   * forty seconds opening a record to use them.
+   *
+   * `toListItem` omitted `materials`, `laborPaise` and `beforePhotoUrls`,
+   * which crashed that row on `beforePhotoUrls.length`. It only showed up
+   * live: the fixtures were full `QuotationDetail` objects, and the client
+   * already declares `fetchJson<QuotationDetail[]>` here — this endpoint was
+   * the side that disagreed.
+   *
+   * Affordable because the queue is short **by design**: fifteen minutes each,
+   * and deliberately unpaginated so the one about to expire cannot hide on
+   * page two.
+   */
+  res.json(rows.map(toDetail));
 });
 
 adminQuotationsRouter.get("/:id", async (req, res) => {
@@ -132,11 +145,19 @@ adminQuotationsRouter.get("/:id", async (req, res) => {
 });
 
 /**
- * Approve, edit-and-approve, or reject.
+ * Admin 5 — change a quotation, or cancel it.
  *
- * One endpoint for all three, because they are one decision with three
- * outcomes and the screen presents them that way. Gated on
- * `quotations.approve` — approving commits CFC to a price.
+ * **Not an approval any more.** A quotation reaches the customer the moment the
+ * pro raises it; this endpoint is the office's 15-minute right to adjust what
+ * the customer is looking at, or to stop it entirely.
+ *
+ * One endpoint for both, because the screen presents them as one decision with
+ * two outcomes. Still gated on `quotations.approve` — the permission that used
+ * to mean "may approve a price" now means "may change one", which is the same
+ * authority over the same money.
+ *
+ * Both are refused once the customer has accepted. That rule lives in the
+ * service so this route cannot forget it.
  */
 adminQuotationsRouter.post(
   "/:id/decide",
@@ -149,6 +170,13 @@ adminQuotationsRouter.post(
       reason?: unknown;
     };
 
+    /**
+     * `outcome` keeps its old vocabulary on the wire.
+     *
+     * `"approved"` now means "keep it, with these figures" and `"rejected"`
+     * means "cancel it". Renaming the field would break every caller for a
+     * word, and the screen's own labels say what actually happens.
+     */
     if (body.outcome !== "approved" && body.outcome !== "rejected") {
       throw badRequest("Outcome must be approved or rejected.", "BAD_OUTCOME");
     }
@@ -178,18 +206,25 @@ adminQuotationsRouter.post(
     }
 
     const actor = actorOf(req);
-    const result = await decideQuotation({
-      quotationId: param(req, "id"),
-      by: actor.name,
-      outcome: body.outcome,
-      ...(materials !== undefined ? { materials } : {}),
-      ...(typeof body.labourPaise === "number" ? { labourPaise: body.labourPaise } : {}),
-      ...(typeof body.reason === "string" ? { reason: body.reason } : {}),
-    });
+    const result =
+      body.outcome === "rejected"
+        ? await cancelQuotation({
+            quotationId: param(req, "id"),
+            by: actor.name,
+            reason: typeof body.reason === "string" ? body.reason : "",
+          })
+        : await editQuotation({
+            quotationId: param(req, "id"),
+            by: actor.name,
+            ...(materials !== undefined ? { materials } : {}),
+            ...(typeof body.labourPaise === "number"
+              ? { labourPaise: body.labourPaise }
+              : {}),
+          });
 
     if (!result.ok) throw conflict(result.reason, "DECISION_FAILED");
 
-    await audit(actor, `quotation.${body.outcome}`, {
+    await audit(actor, body.outcome === "rejected" ? "quotation.cancelled" : "quotation.edited", {
       subject: param(req, "id"),
       detail: {
         jobRef: result.quotation.jobRef,
@@ -204,14 +239,5 @@ adminQuotationsRouter.post(
     });
 
     res.json(toDetail(result.quotation));
-  },
-);
-
-/** Forces the expiry sweep. The timer does this; the endpoint is for tests. */
-adminQuotationsRouter.post(
-  "/sweep",
-  requirePermission("quotations.approve"),
-  async (_req, res) => {
-    res.json(await sweepQuotations());
   },
 );

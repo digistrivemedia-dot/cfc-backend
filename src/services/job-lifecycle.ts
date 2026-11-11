@@ -2,6 +2,7 @@ import { CFC_COMMISSION_BPS, COMMISSION_FREE_JOBS } from "@cfc/types";
 import { Booking, canTransition, type BookingDoc } from "../models/booking";
 import { notify } from "../models/notification";
 import { Pro, type ProDoc } from "../models/pro";
+import { Quotation } from "../models/quotation";
 import { getSettings } from "../models/settings";
 import { newId } from "../models/id";
 import { creditJob } from "./earnings";
@@ -15,10 +16,12 @@ import { creditJob } from "./earnings";
  *   1. **OTP first.** It is the customer's own confirmation that the work is
  *      done, and no other check matters without it.
  *   2. **At least one after-photo.** Proof of what was left behind.
- *   3. **GPS within the configured limit** — and a *known* distance beyond it
+ *   3. **Accepted quoted work started**, with the customer's own code — its
+ *      money is in this settlement.
+ *   4. **GPS within the configured limit** — and a *known* distance beyond it
  *      blocks while an *unknown* one does not.
  *
- * That third rule is the one to not "improve". A pro who has done the work must
+ * The **fourth** rule is the one to not "improve". A pro who has done the work must
  * be able to close the job. A weak indoor signal is the one thing they cannot
  * fix, and blocking there turns the platform's proof requirement into their
  * problem. The missing fix is recorded for admin review instead
@@ -67,17 +70,32 @@ export function settle(grossPaise: number, jobsCompletedBefore: number) {
 /**
  * What the pro earns on a booking.
  *
- * The work plus any on-site extras, less the discount. **Not the customer's
- * total**: the platform fee and its GST are CFC's, and `PRO-OPEN-ITEMS` is
- * explicit that treating GST as a pro deduction would cost each pro ₹270 on a
- * ₹1,500 job.
+ * The work plus any on-site extras **plus accepted quoted work**, less the
+ * discount. **Not the customer's total**: the platform fee and its GST are
+ * CFC's, and `PRO-OPEN-ITEMS` is explicit that treating GST as a pro deduction
+ * would cost each pro ₹270 on a ₹1,500 job.
+ *
+ * ## `quotedWorkPaise` was missing, and nobody was paid for it
+ *
+ * The quotation flow priced the work, had an admin approve it and a customer
+ * accept it — and the figure then reached nothing. The word "quotation" did
+ * not appear in this file, in `earnings.ts`, or in `pricing.ts`. A pro could
+ * do ₹3,700 of approved work and be settled for the original ₹350 booking.
+ *
+ * Including it here is the whole fix, because this is the single function the
+ * settlement, the job screen's "what you earn" and the completion response all
+ * read. Commission therefore applies to the **full quotation total**, materials
+ * included — the client's decision, recorded here because it is the one place
+ * it takes effect. Worth knowing what it means: on a quote that is mostly
+ * parts, the 15% comes off money the pro has already spent at the counter.
  */
 export function grossFor(booking: BookingDoc): number {
   const extras = booking.extraCharges.reduce((s, c) => s + c.amountPaise, 0);
   return (
     booking.breakdown.servicePaise +
     booking.breakdown.addOnsPaise +
-    extras -
+    extras +
+    (booking.quotedWorkPaise ?? 0) -
     booking.breakdown.discountPaise
   );
 }
@@ -161,6 +179,14 @@ export type CompletionRejection =
   | { reason: "wrong-otp" }
   | { reason: "no-after-photos" }
   | { reason: "too-far"; metres: number; limit: number }
+  /**
+   * An accepted quotation whose work never started.
+   *
+   * Its money is in this settlement, and the customer's code is the only proof
+   * they agreed to it at the door. Carries the quotation id so the pro's screen
+   * can send them straight to the code box rather than describing where it is.
+   */
+  | { reason: "quote-not-started"; quotationId: string }
   | { reason: "bad-state"; message: string };
 
 export type CompletionResult =
@@ -225,7 +251,35 @@ export async function completeJob(input: {
     return { ok: false, error: { reason: "no-after-photos" } };
   }
 
-  // 3. The GPS gate. A *known* distance beyond the limit blocks; an *unknown*
+  /**
+   * 3. Accepted quoted work must have been **started with the customer's
+   *    code**.
+   *
+   * Third, not first: the booking's own completion OTP is still the customer
+   * confirming the visit is finished, and a pro who typed the wrong code should
+   * be told that rather than sent off to chase a quotation. But this comes
+   * before the GPS check, because it is a thing the pro can actually fix by
+   * asking the customer standing next to them — unlike a weak indoor signal.
+   *
+   * Checked here rather than at the route, so every caller is gated: the money
+   * for this work is in the settlement a few lines below.
+   */
+  const unstarted = await Quotation.findOne({
+    bookingId: booking._id,
+    status: "customer_accepted",
+    workStartedAt: { $exists: false },
+  })
+    .select({ _id: 1 })
+    .lean<{ _id: string }>();
+
+  if (unstarted) {
+    return {
+      ok: false,
+      error: { reason: "quote-not-started", quotationId: unstarted._id },
+    };
+  }
+
+  // 4. The GPS gate. A *known* distance beyond the limit blocks; an *unknown*
   //    one does not. Do not "improve" this — see the file header.
   const settings = await getSettings();
   const limit = settings.gpsLimitMetres;

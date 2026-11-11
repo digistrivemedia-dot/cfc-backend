@@ -103,12 +103,54 @@ export interface QuotationDoc {
   templatePricePaise: number;
 
   // -- the customer's decision ----------------------------------------------
-  /** The 50% advance, computed once at approval so both halves always sum. */
+  /**
+   * @deprecated The 50% advance is gone. **The customer pays in full on
+   * completion**, so accepting a quotation moves no money.
+   *
+   * Kept on the schema, and only on the schema: quotations taken under the old
+   * flow carry a real advance that was really collected, and zeroing those
+   * rows would rewrite what somebody actually paid. Nothing writes these any
+   * more and no projection sends them.
+   */
   advancePaise: number;
+  /** @deprecated See `advancePaise`. */
   balancePaise: number;
+  /** @deprecated See `advancePaise`. */
   advancePaid: boolean;
   acceptedAt?: Date;
   declinedAt?: Date;
+
+  /**
+   * The code the customer reads out to start the **quoted** work.
+   *
+   * Generated when the customer confirms, and separate from the booking's own
+   * `startOtp` deliberately: that one proves the customer let the pro in to do
+   * the work they booked. This one proves they agreed, in person and at the
+   * door, to a different and usually much larger piece of work — on your own
+   * data, a ₹350 booking turning into ₹3,700.
+   *
+   * **Never sent to the professional.** The server compares it. A code the pro
+   * can read out of a response proves nothing at all.
+   *
+   * Cleared once used, so a screenshot taken during the visit is worth nothing
+   * afterwards.
+   */
+  startOtp: string | null;
+
+  /**
+   * When the pro entered that code.
+   *
+   * Carried instead of a new `QuotationStatus` member: "accepted" and "work
+   * under way" are the same agreement at two moments, and a sixth status would
+   * have to be taught to every badge, filter and label in three apps to say
+   * something a timestamp says exactly.
+   *
+   * **It gates completion.** `completeJob` refuses to close a job with an
+   * accepted quotation that never started, because the money for that work is
+   * now in the pro's settlement and the customer's in-person confirmation is
+   * the only thing standing behind it.
+   */
+  workStartedAt?: Date;
 
   /**
    * Questions the customer asked. Customer 23.
@@ -171,6 +213,9 @@ const quotationSchema = new Schema<QuotationDoc>(
     acceptedAt: { type: Date },
     declinedAt: { type: Date },
 
+    startOtp: { type: String, default: null },
+    workStartedAt: { type: Date },
+
     questions: {
       type: [
         new Schema(
@@ -202,13 +247,11 @@ export function quoteTotal(
 }
 
 /**
- * The 50% advance, per the agreement.
+ * @deprecated **There is no advance.** The customer pays the full quotation
+ * when the job is finished, with the booking.
  *
- * *"Customer advance on quote accept: 50%, balance on completion."*
- *
- * Rounded to the nearest rupee with the **balance taking the remainder**, so
- * the two halves always sum to the total. Rounding both independently is how a
- * customer ends up owing one paisa more than the quotation said.
+ * Kept only because `@cfc/mocks` re-exports it for the fixture path, which has
+ * no server to read a figure from. Delete it with the fixtures.
  */
 export function splitQuotation(totalPaise: number): {
   advancePaise: number;

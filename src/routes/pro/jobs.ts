@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { ProJob, ProJobStatus } from "@cfc/types";
+import type { ProJob, ProJobQuotation, ProJobStatus } from "@cfc/types";
 import fsPromises from "node:fs/promises";
 import nodePath from "node:path";
 import { badRequest, conflict, forbidden, notFound } from "../../error";
@@ -32,7 +32,13 @@ import {
   settle,
   startJob,
 } from "../../services/job-lifecycle";
-import { submitQuotation } from "../../services/quotation";
+import {
+  proRights,
+  reviseQuotation,
+  startQuotedWork,
+  submitQuotation,
+  withdrawQuotation,
+} from "../../services/quotation";
 import { Quotation, type QuotationDoc } from "../../models/quotation";
 import { param } from "../../params";
 
@@ -86,9 +92,118 @@ function shortName(full: string, phone: string): string {
   return parts[1] ? `${first} ${parts[1].charAt(0)}.` : first;
 }
 
-/** Maps a booking status onto the pro's own workflow vocabulary. */
-function proStatus(booking: BookingDoc, offered: boolean): ProJobStatus {
+/**
+ * A quotation as the pro sees it. **The one mapper.**
+ *
+ * Used by `GET /jobs/:id/quotation` *and* by every job projection, so the
+ * figures and the clock on the job screen cannot drift from the ones on the
+ * quotation screen.
+ */
+function projectQuotation(q: QuotationDoc): ProJobQuotation {
+  return {
+    id: q._id,
+    status: q.status,
+    submittedTotalPaise: q.submittedTotalPaise,
+    totalPaise: q.totalPaise,
+    // So a pro sees that the office changed the figure, and by how much —
+    // rather than discovering it from the customer.
+    edited: q.edited,
+    minutesRemaining:
+      q.status === "pending"
+        ? Math.max(0, Math.ceil((q.decisionBy.getTime() - Date.now()) / 60_000))
+        : null,
+    decisionBy: q.decisionBy.toISOString(),
+    rejectionReason: q.rejectionReason ?? null,
+
+    /**
+     * The quotation's own content, so the work screen can show what was quoted
+     * and the quote form can be reopened with it rather than from blank.
+     *
+     * The pro wrote all of this. Withholding it was not a privacy decision,
+     * just an omission — and it meant a pro could see that a quotation existed
+     * without seeing what was in it.
+     */
+    proNotes: q.proNotes,
+    materials: q.materials,
+    labourPaise: q.labourPaise,
+
+    /**
+     * What this professional may still do about it.
+     *
+     * Sent rather than derived on the screen, so the button and the server
+     * cannot disagree — an Edit the server then refuses is worse than no Edit.
+     * `restriction` carries the *reason*, because a disabled control with no
+     * explanation is the most frustrating thing in any app.
+     */
+    ...(() => {
+      const rights = proRights(q);
+      return {
+        mayRevise: rights.mayRevise,
+        mayWithdraw: rights.mayWithdraw,
+        restriction: rights.reason,
+      };
+    })(),
+    /**
+     * Whether the customer's code has been entered.
+     *
+     * **`startOtp` is deliberately absent from this projection.** It is the
+     * customer's to read aloud; a pro who could pull it out of their own job
+     * response could start — and be paid for — quoted work the customer never
+     * confirmed, which is the entire thing the code exists to prevent. Same
+     * rule as `completionOtp`, which this file already forces to null.
+     */
+    workStarted: q.workStartedAt !== undefined,
+  };
+}
+
+/**
+ * The latest quotation on each of these bookings, keyed by booking id.
+ *
+ * One query for a whole list rather than one per row: the job list already
+ * pays an N+1 for its checklists and that is enough of them.
+ */
+async function quotationsFor(
+  bookingIds: string[],
+  proId: string,
+): Promise<Map<string, ProJobQuotation>> {
+  if (bookingIds.length === 0) return new Map();
+
+  const rows = await Quotation.find({
+    bookingId: { $in: bookingIds },
+    proId,
+  })
+    // Newest first, so the first one seen per booking is the one that counts: a
+    // rejected quote can be revised, and what the pro needs is where they
+    // stand now.
+    .sort({ createdAt: -1 })
+    .lean<QuotationDoc[]>();
+
+  const byBooking = new Map<string, ProJobQuotation>();
+  for (const q of rows) {
+    if (!byBooking.has(q.bookingId)) {
+      byBooking.set(q.bookingId, projectQuotation(q));
+    }
+  }
+  return byBooking;
+}
+
+/**
+ * Maps a booking status onto the pro's own workflow vocabulary.
+ *
+ * **A pending quotation outranks the booking's own status.** `awaiting_quote`
+ * has existed in `@cfc/types` from the start — labelled "Quote sent", and
+ * collected by the Active tab — and nothing ever returned it, so a pro who had
+ * raised a quotation saw a job reading "In progress" with no sign the office
+ * had it. The rule belongs here rather than on a screen, because the job list
+ * and the job detail both read this and must not disagree.
+ */
+function proStatus(
+  booking: BookingDoc,
+  offered: boolean,
+  quotation: ProJobQuotation | null,
+): ProJobStatus {
   if (offered) return "offered";
+  if (quotation?.status === "pending") return "awaiting_quote";
   switch (booking.status) {
     case "assigned":
       // "Upcoming" if it is not today; a pro's Active tab should hold what they
@@ -128,16 +243,25 @@ function projectJob(
     offerId?: string;
     expiresInSeconds?: number;
     checklist: string[];
+    /**
+     * Optional, defaulting to none.
+     *
+     * The paths where a quotation cannot yet exist — an offer, a fresh claim,
+     * the moment work starts — say nothing rather than each having to pass an
+     * explicit null.
+     */
+    quotation?: ProJobQuotation | null;
   },
 ): ProJob & { offerId?: string; expiresInSeconds?: number } {
   const { grossEarningPaise, netEarningPaise } = earningsFor(booking, pro);
   const { released } = options;
+  const quotation = options.quotation ?? null;
 
   return {
     id: booking._id,
     reference: booking.reference,
     serviceName: booking.serviceName,
-    status: proStatus(booking, options.offered),
+    status: proStatus(booking, options.offered, quotation),
     scheduledAt: booking.scheduledAt.toISOString(),
     customerName: shortName(booking.customerName, booking.customerPhone),
     area: booking.address.area,
@@ -184,6 +308,8 @@ function projectJob(
     checklist: options.checklist,
     beforePhotoUrls: booking.beforePhotoPaths.map((p) => `${PUBLIC_PREFIX}/${p}`),
     afterPhotoUrls: booking.afterPhotoPaths.map((p) => `${PUBLIC_PREFIX}/${p}`),
+
+    quotation,
 
     ...(options.offerId !== undefined ? { offerId: options.offerId } : {}),
     ...(options.expiresInSeconds !== undefined
@@ -354,6 +480,13 @@ proJobsRouter.get("/jobs", async (req, res) => {
     .sort({ scheduledAt: 1 })
     .lean<BookingDoc[]>();
 
+  // One query for the lot, so the "Quote sent" status on this list is the same
+  // one the job screen shows.
+  const quotations = await quotationsFor(
+    rows.map((b) => b._id),
+    pro._id,
+  );
+
   const jobs = await Promise.all(
     rows.map(async (b) =>
       projectJob(b, pro, {
@@ -362,6 +495,7 @@ proJobsRouter.get("/jobs", async (req, res) => {
         offered: false,
         distanceKm: null,
         checklist: await checklistFor(b.serviceId),
+        quotation: quotations.get(b._id) ?? null,
       }),
     ),
   );
@@ -491,12 +625,15 @@ proJobsRouter.get("/jobs/:id", async (req, res) => {
   // anyone needs to know.
   if (!booking) throw notFound("That job could not be found.");
 
+  const quotations = await quotationsFor([booking._id], pro._id);
+
   res.json(
     projectJob(booking, pro, {
       released: true,
       offered: false,
       distanceKm: null,
       checklist: await checklistFor(booking.serviceId),
+      quotation: quotations.get(booking._id) ?? null,
     }),
   );
 });
@@ -836,20 +973,123 @@ proJobsRouter.get("/jobs/:id/quotation", async (req, res) => {
     return;
   }
 
-  res.json({
-    id: quote._id,
-    status: quote.status,
-    submittedTotalPaise: quote.submittedTotalPaise,
-    totalPaise: quote.totalPaise,
-    // So a pro sees that the office changed the figure, and by how much —
-    // rather than discovering it from the customer.
-    edited: quote.edited,
-    minutesRemaining:
-      quote.status === "pending"
-        ? Math.max(0, Math.ceil((quote.decisionBy.getTime() - Date.now()) / 60_000))
-        : null,
-    rejectionReason: quote.rejectionReason ?? null,
-    advancePaise: quote.advancePaise,
-    advancePaid: quote.advancePaid,
+  // The same mapper the job projection uses, so this endpoint and the job
+  // screen cannot report different figures or a different clock.
+  res.json(projectQuotation(quote));
+});
+
+/**
+ * Pro 16 — revise a quotation the professional already raised.
+ *
+ * `PATCH`, not a second `POST`: this changes a quotation that exists rather
+ * than creating one, and the pro's quote form reopens with the current figures
+ * instead of a blank page.
+ *
+ * Refused once the customer has approved, and once the office has adjusted it.
+ * Both rules live in `proRights`, so this route cannot forget either.
+ */
+proJobsRouter.patch("/quotations/:id", async (req, res) => {
+  const pro = await loadPro(actorOf(req).id);
+  const body = (req.body ?? {}) as {
+    description?: unknown;
+    materials?: unknown;
+    labourPaise?: unknown;
+  };
+
+  if (
+    body.labourPaise !== undefined &&
+    (typeof body.labourPaise !== "number" ||
+      !Number.isInteger(body.labourPaise) ||
+      body.labourPaise < 0)
+  ) {
+    throw badRequest("Labour must be a whole number of paise.", "BAD_AMOUNT");
+  }
+
+  let materials: { description: string; costPaise: number }[] | undefined;
+  if (Array.isArray(body.materials)) {
+    materials = body.materials.map((m, i) => {
+      const line = m as { description?: unknown; costPaise?: unknown };
+      if (typeof line.description !== "string" || line.description.trim() === "") {
+        // The customer reads these lines. An unlabelled cost invites a dispute
+        // the pro will be on the wrong end of.
+        throw badRequest(`Material ${i + 1} needs a description.`, "BAD_MATERIAL");
+      }
+      if (
+        typeof line.costPaise !== "number" ||
+        !Number.isInteger(line.costPaise) ||
+        line.costPaise < 0
+      ) {
+        throw badRequest(
+          `Material ${i + 1} cost must be a whole number of paise.`,
+          "BAD_AMOUNT",
+        );
+      }
+      return { description: line.description.trim(), costPaise: line.costPaise };
+    });
+  }
+
+  const result = await reviseQuotation({
+    proId: pro._id,
+    quotationId: param(req, "id"),
+    ...(typeof body.description === "string" ? { description: body.description } : {}),
+    ...(materials !== undefined ? { materials } : {}),
+    ...(typeof body.labourPaise === "number" ? { labourPaise: body.labourPaise } : {}),
   });
+
+  if (!result.ok) throw conflict(result.reason, "REVISE_FAILED");
+  res.json(projectQuotation(result.quotation));
+});
+
+/**
+ * Pro 16 — withdraw a quotation.
+ *
+ * The route back to a clean slate: one live quotation per job is the rule, so a
+ * pro who quoted the wrong work needs this before they can quote the right
+ * work. Available even after the office has adjusted it — a professional must
+ * be able to take back a price they no longer stand behind.
+ */
+proJobsRouter.post("/quotations/:id/withdraw", async (req, res) => {
+  const pro = await loadPro(actorOf(req).id);
+  const result = await withdrawQuotation({
+    proId: pro._id,
+    quotationId: param(req, "id"),
+  });
+
+  if (!result.ok) throw conflict(result.reason, "WITHDRAW_FAILED");
+  res.json(projectQuotation(result.quotation));
+});
+
+/**
+ * Pro 17 — the customer has confirmed; start the quoted work.
+ *
+ * The code comes from the customer's screen, read aloud at the door. A wrong
+ * one is a **400 with `WRONG_OTP`**, distinct from a bad state, so the pro's
+ * screen marks the field rather than claiming the work cannot be started.
+ *
+ * Gated on the quotation, not the booking: the booking is already
+ * `in_progress` — the pro has been working on the original job all along — and
+ * what needs confirming is the *extra* work, which is its own agreement at its
+ * own price.
+ */
+proJobsRouter.post("/quotations/:id/start", async (req, res) => {
+  const pro = await loadPro(actorOf(req).id);
+  const otp = (req.body as { otp?: unknown })?.otp;
+
+  if (typeof otp !== "string" || otp.trim() === "") {
+    throw badRequest("Ask the customer to read out their code.", "MISSING_OTP");
+  }
+
+  const result = await startQuotedWork({
+    proId: pro._id,
+    quotationId: param(req, "id"),
+    otp,
+  });
+
+  if (!result.ok) {
+    throw result.wrongOtp
+      ? badRequest(result.reason, "WRONG_OTP")
+      : conflict(result.reason, "BAD_STATE");
+  }
+
+  res.json(projectQuotation(result.quotation));
 });

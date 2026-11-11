@@ -4,7 +4,6 @@ import { describe, env } from "./env";
 import { ensureUploadDirs } from "./uploads";
 import { warmSuperAdmin } from "./auth/super-admin";
 import { sweepDispatch } from "./services/dispatch";
-import { sweepQuotations } from "./services/quotation";
 
 /**
  * Boot.
@@ -47,12 +46,16 @@ async function main(): Promise<void> {
    * the reason to move to a single scheduled worker before scaling out.
    */
   const sweep = setInterval(() => {
-    // Quotations lapse at 15 minutes; dispatch offers at 30 seconds. One timer
-    // for both, because a second interval would be a second thing to stop on
-    // shutdown for no benefit.
-    void sweepQuotations().catch((err: unknown) => {
-      console.error("[quotation] sweep failed", err);
-    });
+    /**
+     * Dispatch only.
+     *
+     * A quotation sweep used to run here too, marking any quotation whose
+     * 15 minutes had passed as `rejected`. That was right while the window was
+     * an **approval deadline** and became exactly wrong when it became an
+     * *edit* window: it deleted a live decision out from under a customer who
+     * had simply not got round to it. A quotation with no decision waits, and
+     * nothing needs a timer to make that happen.
+     */
     void sweepDispatch().catch((err: unknown) => {
       // Logged and swallowed: a failed sweep must not kill the timer, or
       // dispatch silently stops escalating for the life of the process.

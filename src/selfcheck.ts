@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
+import mongoose from "mongoose";
 import type { Actor } from "@cfc/types";
 import { ADMIN_SECTIONS, areaScope, can, canOpen } from "@cfc/types";
 import { createApp } from "./app";
@@ -32,8 +33,10 @@ import { Payout } from "./services/payout";
  * Stage A's runnable check. `pnpm --filter @cfc/server test`
  *
  * Deliberately not a test framework: it boots the real app on an ephemeral
- * port, against the real database, and makes real requests. The point is to
- * prove the plumbing end to end, and a mocked Mongo would prove the mock.
+ * port, against a real Mongo, and makes real requests. The point is to prove
+ * the plumbing end to end, and a mocked Mongo would prove the mock.
+ *
+ * **A real Mongo, but never the working database.** See `SELFCHECK_DB`.
  *
  * It covers the two things in Stage A that can be wrong without being obvious:
  * the error envelope's shape — every error screen in three apps renders from
@@ -44,6 +47,19 @@ import { Payout } from "./services/payout";
  * has never failed is not evidence it works."* So each assertion here is
  * written against a planted violation, not just a happy path.
  */
+
+/**
+ * The database this suite is allowed to touch.
+ *
+ * Same cluster and credentials as `MONGODB_URI`, different database — so no
+ * extra configuration, no second connection string to keep in sync, and
+ * nothing to remember before running it.
+ *
+ * It exists because the suite is destructive and used to run against whatever
+ * `MONGODB_URI` pointed at. It starts empty on a fresh database and seeds
+ * everything it needs, so there is nothing to restore afterwards either.
+ */
+const SELFCHECK_DB = "cfc_selfcheck";
 
 async function main(): Promise<void> {
   let failures = 0;
@@ -82,10 +98,33 @@ async function main(): Promise<void> {
     assert.throws(() => resolveWithin(PRIVATE_ROOT, "..\\public\\leak.jpg"));
   });
 
-  console.info("[selfcheck] booting app against the real database");
+  console.info(`[selfcheck] booting app against database "${SELFCHECK_DB}"`);
 
   ensureUploadDirs();
-  await connect();
+  await connect(SELFCHECK_DB);
+
+  /**
+   * The suite must never be pointed at real data.
+   *
+   * It is not a read-only check: it overwrites `servicePincodes` wholesale,
+   * and it runs `Booking.deleteMany`, `WalletEntry.deleteMany` and
+   * `Customer.deleteMany({ phone: /^\+9196/ })`. Against the working database
+   * that is a data-loss event, and it already cost one: a run reset platform
+   * coverage to `["620006"]`, which made every real address unserviceable and
+   * refused bookings with "not available in your location" until the pincodes
+   * were typed in again.
+   *
+   * Asserted rather than trusted, because `dbName` silently does nothing if a
+   * future change moves the option or drops it.
+   */
+  const connected = mongoose.connection.name;
+  if (connected !== SELFCHECK_DB) {
+    throw new Error(
+      `[selfcheck] refusing to run: connected to "${connected}", not ` +
+        `"${SELFCHECK_DB}". This suite deletes data — it must never touch ` +
+        `the working database.`,
+    );
+  }
 
   const server = createApp().listen(0);
   await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -1469,6 +1508,19 @@ async function checkBooking(
     });
 
     // -- addresses ----------------------------------------------------------
+    //
+    // The coverage these assertions need, stated rather than assumed.
+    //
+    // They used to pass only because the working database happened to have
+    // Srirangam and 620006 configured — the suite was silently reading real
+    // platform settings, so `serviceable` and `pickArea` were being checked
+    // against whatever the admin had last saved. On its own database it starts
+    // empty, and a check that depends on data it did not create is not a check.
+    await call("PATCH", "/admin/settings", {
+      serviceAreas: ["Srirangam", "Thillai Nagar", "K.K. Nagar"],
+      servicePincodes: ["620006"],
+    }, adminToken);
+
     const badPin = await call("PUT", "/consumer/addresses", {
       label: "home", line1: "1 Test St", area: "Srirangam",
       city: "Tiruchirappalli", state: "Tamil Nadu", pincode: "99",
@@ -3704,19 +3756,134 @@ async function checkQuotations(
       assert.equal(second.ok, false);
     });
 
-    // -- the customer must not see it yet ------------------------------------
-    const tooEarly = await call("GET", `/consumer/quotations/${quotationId}`, undefined, custToken);
-    check("a pending quotation is invisible to the customer", () => {
-      // It would invite them to accept something CFC has not agreed to.
-      assert.equal(tooEarly.status, 404);
+    /**
+     * -- the pro can find their way back to it -------------------------------
+     *
+     * The job itself has to say a quotation exists. Without this the pro app
+     * showed nothing: the job read "In progress", the status screen was
+     * reachable only by submitting again, and the obvious move was to raise a
+     * second quotation for work already quoted — which the check above refuses,
+     * leaving them stuck with no explanation.
+     *
+     * Asserted on the **list as well as the detail**, because `awaiting_quote`
+     * is derived from the quotation and two screens deriving it from different
+     * data is how one says "Quote sent" while the other says "In progress".
+     */
+    const jobWithQuote = (await (
+      await call("GET", `/pro/jobs/${bookingId}`, undefined, proToken)
+    ).json()) as {
+      status?: string;
+      quotation?: {
+        id?: string;
+        status?: string;
+        submittedTotalPaise?: number;
+        minutesRemaining?: number | null;
+        decisionBy?: string;
+      } | null;
+    };
+    check("the pro's job carries the quotation it is waiting on", () => {
+      assert.equal(jobWithQuote.quotation?.id, quotationId);
+      assert.equal(jobWithQuote.quotation?.status, "pending");
+      assert.equal(jobWithQuote.quotation?.submittedTotalPaise, 600_000);
+      // The exact deadline, so the pro's clock can tick in seconds rather
+      // than inventing them from a rounded minute count.
+      const left = (Date.parse(jobWithQuote.quotation?.decisionBy ?? "") - Date.now()) / 60_000;
+      assert.ok(left > 13 && left <= 15, `window was ${left} minutes`);
+    });
+
+    check("a pending quotation shows the job as awaiting_quote", () => {
+      // The status existed in @cfc/types from the start and nothing ever
+      // returned it.
+      assert.equal(jobWithQuote.status, "awaiting_quote");
+    });
+
+    const activeJobs = (await (
+      await call("GET", "/pro/jobs?tab=active", undefined, proToken)
+    ).json()) as { id: string; status: string; quotation: { id?: string } | null }[];
+    check("the job list agrees with the job screen about the quote", () => {
+      const row = activeJobs.find((j) => j.id === bookingId);
+      assert.ok(row, "the job was missing from the active tab");
+      assert.equal(row.status, "awaiting_quote");
+      assert.equal(row.quotation?.id, quotationId);
+    });
+
+    /**
+     * -- it reaches the customer immediately ---------------------------------
+     *
+     * **The removed gate.** A quotation used to be invisible to the customer
+     * until an admin approved it, and this suite asserted the 404. It now goes
+     * straight to them, so the same two checks assert the opposite.
+     */
+    const straightAway = (await (
+      await call("GET", `/consumer/quotations/${quotationId}`, undefined, custToken)
+    ).json()) as { totalPaise?: number; status?: string; officeMayStillEdit?: boolean };
+    check("a quotation reaches the customer with no approval step", () => {
+      assert.equal(straightAway.status, "pending");
+      assert.equal(straightAway.totalPaise, 600_000);
+    });
+
+    check("the customer is told the office can still change it", () => {
+      // Approving while this is true is what locks the amount, so they are
+      // told before they tap rather than after.
+      assert.equal(straightAway.officeMayStillEdit, true);
     });
 
     const earlyList = (await (
       await call("GET", "/consumer/quotations", undefined, custToken)
     ).json()) as unknown[];
-    check("the customer's list excludes pending quotations", () => {
-      assert.equal(earlyList.length, 0);
+    check("the customer's list includes it straight away", () => {
+      assert.equal(earlyList.length, 1);
     });
+
+    /**
+     * -- the pro revises and withdraws their own quotation -------------------
+     *
+     * There was no path for this at all: the work screen offered "Raise a
+     * quotation" with one already live, the server refused it as a duplicate,
+     * and only the office could change a figure the pro had got wrong.
+     */
+    const proRevised = (await (
+      await call("PATCH", `/pro/quotations/${quotationId}`, {
+        description: "The inlet pipe and the isolating valve both need replacing.",
+        materials: [{ description: "Inlet pipe, 1m", costPaise: 180_000 }],
+        labourPaise: 320_000,
+      }, proToken)
+    ).json()) as {
+      totalPaise?: number;
+      submittedTotalPaise?: number;
+      proNotes?: string;
+      mayRevise?: boolean;
+    };
+    check("the pro may revise their own quotation", () => {
+      assert.equal(proRevised.totalPaise, 500_000);
+      assert.match(proRevised.proNotes ?? "", /isolating valve/);
+    });
+
+    check("a pro revision moves BOTH figures", () => {
+      // `submittedTotalPaise` means "what the professional stands behind", not
+      // "the first number they typed" — so a revision replaces it too. That is
+      // only coherent because the office has not edited this one.
+      assert.equal(proRevised.submittedTotalPaise, 500_000);
+    });
+
+    const custSeesRevision = (await (
+      await call("GET", `/consumer/quotations/${quotationId}`, undefined, custToken)
+    ).json()) as { totalPaise?: number; proNotes?: string };
+    check("the customer sees the revision immediately", () => {
+      assert.equal(custSeesRevision.totalPaise, 500_000);
+      assert.match(custSeesRevision.proNotes ?? "", /isolating valve/);
+    });
+
+    // Put it back to the original quote, so the figures the office-edit
+    // checks below assert on are the ones the pro actually submitted.
+    await call("PATCH", `/pro/quotations/${quotationId}`, {
+      description: "The inlet pipe is corroded through and needs replacing.",
+      materials: [
+        { description: "Inlet pipe, 1m", costPaise: 180_000 },
+        { description: "Sealant and clips", costPaise: 20_000 },
+      ],
+      labourPaise: 400_000,
+    }, proToken);
 
     // -- the admin queue -----------------------------------------------------
     const detail = (await (
@@ -3729,7 +3896,7 @@ async function checkQuotations(
       beforePhotoUrls?: string[];
       submittedTotalPaise?: number;
     };
-    check("the admin sees the clock draining", () => {
+    check("the admin sees their edit window draining", () => {
       assert.ok((detail.minutesRemaining ?? 0) > 0);
     });
 
@@ -3746,12 +3913,12 @@ async function checkQuotations(
     const rejectNoReason = await call(
       "POST", `/admin/quotations/${quotationId}/decide`, { outcome: "rejected" }, adminToken,
     );
-    check("rejecting a quotation with no reason is refused", () => {
+    check("withdrawing a quotation with no reason is refused", () => {
       // The pro reads it, and they are still in the customer's house.
       assert.equal(rejectNoReason.status, 409);
     });
 
-    // -- edit and approve, which must keep both figures ----------------------
+    // -- the office edits inside its window, keeping both figures ------------
     const approved = (await (
       await call("POST", `/admin/quotations/${quotationId}/decide`, {
         outcome: "approved",
@@ -3771,12 +3938,14 @@ async function checkQuotations(
       status?: string;
     };
 
-    check("edit-and-approve records the approved figure", () => {
+    check("an office edit records the new figure", () => {
       assert.equal(approved.totalPaise, 500_000);
-      assert.equal(approved.status, "approved");
+      // **Still `pending`.** An edit is not an approval: the quotation was
+      // already with the customer and stays there.
+      assert.equal(approved.status, "pending");
     });
 
-    check("edit-and-approve KEEPS the pro's original figure", () => {
+    check("an office edit KEEPS the pro's original figure", () => {
       // The whole reason this schema separates the two. Without it, the pro
       // says they quoted ₹6,000, the customer was charged ₹5,000, and there is
       // nothing to check.
@@ -3784,23 +3953,26 @@ async function checkQuotations(
       assert.equal(approved.edited, true);
     });
 
-    check("the 50% advance and balance always sum to the total", () => {
-      // Rounding both independently is how a customer ends up owing a paisa
-      // more than the quotation said.
-      assert.equal(
-        (approved.advancePaise ?? 0) + (approved.balancePaise ?? 0),
-        approved.totalPaise,
-      );
-      assert.equal(approved.advancePaise, 250_000);
+    check("no advance is computed or sent", () => {
+      // The 50% advance is gone: the customer pays in full on completion, so
+      // accepting moves no money and no split is quoted to anyone.
+      const asRecord = approved as unknown as Record<string, unknown>;
+      assert.equal(asRecord["advancePaise"], undefined);
+      assert.equal(asRecord["balancePaise"], undefined);
     });
 
-    const twice = await call(
-      "POST", `/admin/quotations/${quotationId}/decide`,
-      { outcome: "approved" }, adminToken,
-    );
-    check("deciding an already-decided quotation is refused", () => {
-      assert.equal(twice.status, 409);
+    const twice = (await (
+      await call("POST", `/admin/quotations/${quotationId}/decide`,
+        { outcome: "approved", labourPaise: 310_000 }, adminToken)
+    ).json()) as { totalPaise?: number };
+    check("the office may edit more than once inside its window", () => {
+      // It is an oversight window, not a one-shot decision.
+      assert.equal(twice.totalPaise, 510_000);
     });
+
+    // Put it back, so the figures the rest of this suite asserts on hold.
+    await call("POST", `/admin/quotations/${quotationId}/decide`,
+      { outcome: "approved", labourPaise: 300_000 }, adminToken);
 
     // -- the pro is told, including that it was edited ------------------------
     const proView = (await (
@@ -3808,7 +3980,7 @@ async function checkQuotations(
     ).json()) as { status?: string; edited?: boolean; totalPaise?: number; submittedTotalPaise?: number };
     check("the pro sees that the office changed the figure", () => {
       // Rather than discovering it from the customer.
-      assert.equal(proView.status, "approved");
+      assert.equal(proView.status, "pending");
       assert.equal(proView.edited, true);
       assert.equal(proView.submittedTotalPaise, 600_000);
       assert.equal(proView.totalPaise, 500_000);
@@ -3823,14 +3995,14 @@ async function checkQuotations(
       minutesRemaining?: number | null;
       beforePhotoUrls?: string[];
     };
-    check("an approved quotation reaches the customer", () => {
+    check("the customer sees the edited figure, not the original", () => {
       assert.equal(visible.totalPaise, 500_000);
-      assert.equal(visible.advancePaise, 250_000);
     });
 
     check("the customer is shown no countdown", () => {
-      // The 15 minutes is an admin rule. A timer here would be a pressure
-      // tactic we invented.
+      // The 15 minutes is the office's window to change the figures, not a
+      // deadline on the customer. A timer here would be a pressure tactic we
+      // invented, and no customer deadline is documented anywhere.
       assert.equal(visible.minutesRemaining, null);
     });
 
@@ -3838,29 +4010,19 @@ async function checkQuotations(
       assert.equal(visible.beforePhotoUrls?.length, 2);
     });
 
-    const online = await call(
-      "POST", `/consumer/quotations/${quotationId}/accept`,
-      { paymentMethod: "upi" }, custToken,
-    );
-    check("paying the advance online answers 503, not a fake acceptance", () => {
-      // A quote marked accepted with no advance behind it would send a pro to
-      // do ₹5,000 of work against nothing.
-      assert.equal(online.status, 503);
-    });
-
-    const brokeWallet = await call(
-      "POST", `/consumer/quotations/${quotationId}/accept`,
-      { paymentMethod: "wallet" }, custToken,
-    );
-    check("a wallet advance with no balance is refused", () => {
-      assert.equal(brokeWallet.status, 409);
-    });
-
+    /**
+     * The wallet is credited here only so the **final payment** later in this
+     * suite has something to draw on. Approving a quotation no longer touches
+     * it: there is no advance.
+     */
     await WalletEntry.create({
       _id: `wtx_qt_${stamp}`,
       customerId, kind: "cashback", label: "Self-check credit",
-      amountPaise: 300_000, status: "completed",
+      amountPaise: 1_000_000, status: "completed",
     });
+    const balanceBeforeAccept = (await (
+      await call("GET", "/consumer/wallet/balance", undefined, custToken)
+    ).json()) as number;
 
     const question = await call(
       "POST", `/consumer/quotations/${quotationId}/question`,
@@ -3874,35 +4036,351 @@ async function checkQuotations(
       assert.match(questionBody.message ?? "", /call/i);
     });
 
-    const accepted = (await (
-      await call("POST", `/consumer/quotations/${quotationId}/accept`,
-        { paymentMethod: "wallet" }, custToken)
-    ).json()) as { status?: string; advancePaid?: boolean };
-    check("the customer accepts and the advance is taken", () => {
-      assert.equal(accepted.status, "customer_accepted");
-      assert.equal(accepted.advancePaid, true);
+    /**
+     * Once the **office** edits, the pro may only withdraw.
+     *
+     * Not a technical limit: two parties editing a price in turns makes
+     * `submittedTotalPaise` meaningless and the dispute it exists to settle
+     * unsettleable again.
+     */
+    await call("POST", `/admin/quotations/${quotationId}/decide`,
+      { outcome: "approved", labourPaise: 300_000 }, adminToken);
+
+    const reviseAfterOffice = await call(
+      "PATCH", `/pro/quotations/${quotationId}`, { labourPaise: 400_000 }, proToken,
+    );
+    check("a pro cannot revise a quotation the office has edited", async () => {
+      assert.equal(reviseAfterOffice.status, 409);
+      const body = (await reviseAfterOffice.json()) as { message?: string };
+      assert.match(body.message ?? "", /office adjusted/i);
     });
 
-    const balanceAfter = (await (
+    const proView2 = (await (
+      await call("GET", `/pro/jobs/${bookingId}/quotation`, undefined, proToken)
+    ).json()) as { mayRevise?: boolean; mayWithdraw?: boolean; restriction?: string | null };
+    check("the pro's own screen is told which actions remain", () => {
+      // Sent by the server, so the button and the endpoint cannot disagree.
+      assert.equal(proView2.mayRevise, false);
+      assert.equal(proView2.mayWithdraw, true);
+      assert.match(proView2.restriction ?? "", /withdraw/i);
+    });
+
+    /**
+     * -- the customer approves, and **no money moves** ----------------------
+     *
+     * Sent with no payment method at all, which is the point: the 50% advance
+     * is gone, so approving is an agreement rather than a transaction.
+     */
+    const accepted = (await (
+      await call("POST", `/consumer/quotations/${quotationId}/accept`,
+        undefined, custToken)
+    ).json()) as { status?: string; startOtp?: string | null };
+    check("the customer approves with no payment", () => {
+      assert.equal(accepted.status, "customer_accepted");
+      assert.match(accepted.startOtp ?? "", /^\d{4}$/);
+    });
+
+    const balanceAfterAccept = (await (
       await call("GET", "/consumer/wallet/balance", undefined, custToken)
     ).json()) as number;
-    check("the wallet is debited by exactly the advance", () => {
-      assert.equal(balanceAfter, 300_000 - 250_000);
+    check("approving a quotation takes nothing from the wallet", () => {
+      assert.equal(balanceAfterAccept, balanceBeforeAccept);
     });
 
     const acceptTwice = await call(
-      "POST", `/consumer/quotations/${quotationId}/accept`,
-      { paymentMethod: "wallet" }, custToken,
+      "POST", `/consumer/quotations/${quotationId}/accept`, undefined, custToken,
     );
-    check("accepting twice cannot charge the advance twice", () => {
+    check("approving twice cannot issue a second code", () => {
       assert.equal(acceptTwice.status, 409);
+    });
+
+    /**
+     * -- acceptance LOCKS the figures ----------------------------------------
+     *
+     * The office's window is still open at this point in the suite, and that
+     * no longer matters. What the customer read is what they pay; the
+     * alternative bills someone for a number they never saw.
+     */
+    const editAfterAccept = await call(
+      "POST", `/admin/quotations/${quotationId}/decide`,
+      { outcome: "approved", labourPaise: 900_000 }, adminToken,
+    );
+    check("the office cannot change an approved quotation", async () => {
+      assert.equal(editAfterAccept.status, 409);
+      const body = (await editAfterAccept.json()) as { message?: string };
+      assert.match(body.message ?? "", /already accepted/i);
+    });
+
+    const cancelAfterAccept = await call(
+      "POST", `/admin/quotations/${quotationId}/decide`,
+      { outcome: "rejected", reason: "Changed our mind about the price." }, adminToken,
+    );
+    check("the office cannot withdraw an approved quotation", () => {
+      assert.equal(cancelAfterAccept.status, 409);
+    });
+
+    const stillFive = (await (
+      await call("GET", `/consumer/quotations/${quotationId}`, undefined, custToken)
+    ).json()) as { totalPaise?: number; officeMayStillEdit?: boolean };
+    check("the locked figure is the one the customer agreed to", () => {
+      assert.equal(stillFive.totalPaise, 500_000);
+      assert.equal(stillFive.officeMayStillEdit, false);
+    });
+
+    const proWithdrawAfterAccept = await call(
+      "POST", `/pro/quotations/${quotationId}/withdraw`, undefined, proToken,
+    );
+    check("the pro cannot withdraw an approved quotation either", () => {
+      // The lock is on the agreement, not on who is asking.
+      assert.equal(proWithdrawAfterAccept.status, 409);
     });
 
     const timeline = await Booking.findById(bookingId).lean();
     check("the booking timeline records the whole quotation flow", () => {
       const labels = (timeline?.events ?? []).map((e) => e.label).join(" | ");
-      assert.match(labels, /Quotation sent/);
-      assert.match(labels, /Quotation accepted/);
+      assert.match(labels, /Quotation raised/);
+      assert.match(labels, /approved by you/);
+    });
+
+    /**
+     * -- the quoted money reaches the pro ------------------------------------
+     *
+     * The hole that mattered most. `grossFor` summed the service, add-ons and
+     * on-site extras; the quotation total appeared in **no money path at all**
+     * — not this file's settlement, not `earnings.ts`, not `pricing.ts`. A pro
+     * could do ₹5,000 of approved work and be settled for the original
+     * booking.
+     *
+     * Asserted as an arithmetic identity rather than a magic number, so it
+     * keeps failing if the booking fixture's own price changes.
+     */
+    const bookingWithQuote = await Booking.findById(bookingId).lean();
+    check("an accepted quotation is added to the booking's settled money", () => {
+      assert.equal(bookingWithQuote?.quotedWorkPaise, 500_000);
+      // `breakdown` is a tax document. It must not absorb later work.
+      assert.equal(timeline?.breakdown.totalPaise, bookingWithQuote?.breakdown.totalPaise);
+    });
+
+    const proJobWithQuote = (await (
+      await call("GET", `/pro/jobs/${bookingId}`, undefined, proToken)
+    ).json()) as {
+      grossEarningPaise?: number;
+      quotation?: { workStarted?: boolean; startOtp?: unknown } | null;
+    };
+    check("the pro's earning includes the quoted work", () => {
+      const b = bookingWithQuote!;
+      const expected =
+        b.breakdown.servicePaise +
+        b.breakdown.addOnsPaise +
+        b.extraCharges.reduce((t, c) => t + c.amountPaise, 0) +
+        500_000 -
+        b.breakdown.discountPaise;
+      assert.equal(proJobWithQuote.grossEarningPaise, expected);
+    });
+
+    check("the quotation's start code is never sent to the pro", () => {
+      // The customer reads it aloud. A pro who could pull it out of their own
+      // job response could start — and be paid for — work nobody confirmed.
+      assert.equal(proJobWithQuote.quotation?.workStarted, false);
+      assert.equal(proJobWithQuote.quotation?.startOtp, undefined);
+    });
+
+    /**
+     * -- the code gates both the quoted work and the completion --------------
+     */
+    /**
+     * -- the customer finds it on their booking ------------------------------
+     *
+     * The quotation had its own screen and its own notification and nothing
+     * else. A customer who opened the booking — the obvious place to look —
+     * saw no quotation, no amount, and a total that excluded both the on-site
+     * extras and the quoted work they had agreed to.
+     */
+    const custBooking = (await (
+      await call("GET", `/consumer/bookings/${bookingId}`, undefined, custToken)
+    ).json()) as {
+      totalPaise?: number;
+      quotedWorkPaise?: number;
+      extraChargesPaise?: number;
+      amountPayablePaise?: number;
+      amountPaidPaise?: number;
+      quotation?: { id?: string; status?: string; totalPaise?: number } | null;
+    };
+
+    check("the customer's booking carries the quotation", () => {
+      assert.equal(custBooking.quotation?.id, quotationId);
+      assert.equal(custBooking.quotation?.status, "customer_accepted");
+      assert.equal(custBooking.quotation?.totalPaise, 500_000);
+    });
+
+    check("the customer's total includes the quoted work", () => {
+      assert.equal(custBooking.quotedWorkPaise, 500_000);
+      assert.equal(
+        custBooking.amountPayablePaise,
+        (custBooking.totalPaise ?? 0) +
+          (custBooking.extraChargesPaise ?? 0) +
+          500_000,
+      );
+      // `totalPaise` is the booking as invoiced and must not have moved — it
+      // is a tax document.
+      assert.equal(custBooking.totalPaise, bookingWithQuote?.breakdown.totalPaise);
+    });
+
+    check("nothing is paid before the job is finished", () => {
+      // No advance, and this is a cash booking: everything falls due at the
+      // end. A customer shown "already paid" here would be told a lie.
+      assert.equal(custBooking.amountPaidPaise, 0);
+    });
+
+    const custQuote = (await (
+      await call("GET", `/consumer/quotations/${quotationId}`, undefined, custToken)
+    ).json()) as { startOtp?: string | null; workStarted?: boolean };
+    check("the customer is given a code to read out", () => {
+      assert.match(custQuote.startOtp ?? "", /^\d{4}$/);
+      assert.equal(custQuote.workStarted, false);
+    });
+
+    await upload(`/pro/jobs/${bookingId}/photos`, { stage: "after" }, proToken);
+
+    const blocked = (await (
+      await call("POST", `/pro/jobs/${bookingId}/complete`,
+        { otp: bookingWithQuote?.completionOtp ?? "" }, proToken)
+    ).json()) as { ok?: boolean; error?: { reason?: string; quotationId?: string } };
+    check("a job with unstarted quoted work cannot be completed", () => {
+      // Its money is in the settlement; the code is the only thing behind it.
+      assert.equal(blocked.ok, false);
+      assert.equal(blocked.error?.reason, "quote-not-started");
+      assert.equal(blocked.error?.quotationId, quotationId);
+    });
+
+    const wrongCode = await call(
+      "POST", `/pro/quotations/${quotationId}/start`, { otp: "0000" }, proToken,
+    );
+    check("a wrong quotation code is refused as WRONG_OTP", async () => {
+      assert.equal(wrongCode.status, 400);
+      const body = (await wrongCode.json()) as { code?: string };
+      assert.equal(body.code, "WRONG_OTP");
+    });
+
+    const startedQuote = (await (
+      await call("POST", `/pro/quotations/${quotationId}/start`,
+        { otp: custQuote.startOtp ?? "" }, proToken)
+    ).json()) as { workStarted?: boolean };
+    check("the right code starts the quoted work", () => {
+      assert.equal(startedQuote.workStarted, true);
+    });
+
+    const spent = (await (
+      await call("GET", `/consumer/quotations/${quotationId}`, undefined, custToken)
+    ).json()) as { startOtp?: string | null; workStarted?: boolean };
+    check("the code is cleared once used", () => {
+      // A screenshot taken during the visit is worth nothing afterwards.
+      assert.equal(spent.startOtp, null);
+      assert.equal(spent.workStarted, true);
+    });
+
+    const restart = await call(
+      "POST", `/pro/quotations/${quotationId}/start`,
+      { otp: custQuote.startOtp ?? "" }, proToken,
+    );
+    check("quoted work cannot be started twice", () => {
+      assert.equal(restart.status, 409);
+    });
+
+    const closed = (await (
+      await call("POST", `/pro/jobs/${bookingId}/complete`,
+        { otp: bookingWithQuote?.completionOtp ?? "" }, proToken)
+    ).json()) as { ok?: boolean; earning?: { grossPaise?: number } };
+    check("the job closes once the quoted work has started", () => {
+      assert.equal(closed.ok, true);
+    });
+
+    /**
+     * -- the customer settles the job ----------------------------------------
+     *
+     * **There was no way to pay anything after booking.** Cash was marked paid
+     * by the completion itself, wallet paid up front, and the online methods
+     * refused at checkout — so nothing needed a payment step. With the advance
+     * removed, every rupee of quoted work falls due here.
+     */
+    const payOnline = await call(
+      "POST", `/consumer/bookings/${bookingId}/pay`,
+      { paymentMethod: "upi" }, custToken,
+    );
+    check("paying online answers 503 rather than faking it", () => {
+      // Razorpay has no keys here. A stub that auto-succeeds would tell a
+      // professional they had been paid when they had not.
+      assert.equal(payOnline.status, 503);
+    });
+
+    const settledByCash = (await (
+      await call("GET", `/consumer/bookings/${bookingId}`, undefined, custToken)
+    ).json()) as { amountPaidPaise?: number; amountPayablePaise?: number };
+    check("a cash job is settled by its completion, quoted work included", () => {
+      // The professional collected at the door, so there is nothing left for
+      // the customer to pay and the screen offers no payment section.
+      assert.equal(settledByCash.amountPaidPaise, settledByCash.amountPayablePaise);
+      assert.ok((settledByCash.amountPayablePaise ?? 0) > 500_000);
+    });
+
+    const payAgain = await call(
+      "POST", `/consumer/bookings/${bookingId}/pay`,
+      { paymentMethod: "cash" }, custToken,
+    );
+    check("a job already paid for cannot be paid again", () => {
+      assert.equal(payAgain.status, 409);
+    });
+
+    /**
+     * The wallet path, against a **planted** unpaid state.
+     *
+     * The suite's own rule: *"a check that has never failed is not evidence it
+     * works"*. A cash booking never reaches this endpoint, so the arithmetic —
+     * which can be wrong by a rupee — needs a job that genuinely owes money.
+     */
+    await Booking.updateOne({ _id: bookingId }, { $set: { paid: false } });
+
+    const dueBefore = (await (
+      await call("GET", `/consumer/bookings/${bookingId}`, undefined, custToken)
+    ).json()) as { amountPayablePaise?: number };
+    const walletBefore = (await (
+      await call("GET", "/consumer/wallet/balance", undefined, custToken)
+    ).json()) as number;
+
+    const paid = (await (
+      await call("POST", `/consumer/bookings/${bookingId}/pay`,
+        { paymentMethod: "wallet" }, custToken)
+    ).json()) as { paid?: boolean; duePaise?: number };
+    check("the customer pays the whole job in one payment at the end", () => {
+      assert.equal(paid.paid, true);
+      // The booking, the on-site extras and the quoted work together.
+      assert.equal(paid.duePaise, dueBefore.amountPayablePaise);
+    });
+
+    const walletAfter = (await (
+      await call("GET", "/consumer/wallet/balance", undefined, custToken)
+    ).json()) as number;
+    check("the wallet is debited by exactly what was due", () => {
+      assert.equal(walletAfter, walletBefore - (dueBefore.amountPayablePaise ?? 0));
+    });
+
+    const payTwice = await call(
+      "POST", `/consumer/bookings/${bookingId}/pay`,
+      { paymentMethod: "wallet" }, custToken,
+    );
+    check("paying twice cannot debit the wallet twice", () => {
+      assert.equal(payTwice.status, 409);
+    });
+
+    check("the settlement is paid on the quoted work too", () => {
+      const b = bookingWithQuote!;
+      const expected =
+        b.breakdown.servicePaise +
+        b.breakdown.addOnsPaise +
+        b.extraCharges.reduce((t, c) => t + c.amountPaise, 0) +
+        500_000 -
+        b.breakdown.discountPaise;
+      assert.equal(closed.earning?.grossPaise, expected);
     });
 
     // -- another customer's quotation ----------------------------------------
@@ -3974,22 +4452,44 @@ async function checkQuotations(
       "POST", `/admin/quotations/${lapsing.quotationId}/decide`,
       { outcome: "approved" }, adminToken,
     );
-    check("an admin cannot approve past the 15-minute window", () => {
-      // An operator whose tab sat open must not decide on a stale view — the
-      // pro has already been told it lapsed.
+    check("the office cannot change a quotation past its window", () => {
       assert.equal(lateDecide.status, 409);
     });
 
-    const sweptQ = (await (
-      await call("POST", "/admin/quotations/sweep", {}, adminToken)
-    ).json()) as { expired?: number };
-    void sweptQ;
+    /**
+     * **A lapsed window leaves the quotation alive.**
+     *
+     * The single most important inversion in this rewrite. The old sweep
+     * marked it `rejected` — correct while the window was an approval
+     * deadline, and exactly wrong now that it is an edit window: it would
+     * delete a live decision out from under a customer who simply had not got
+     * round to it. There is no sweep any more, so this asserts that nothing
+     * happened.
+     */
+    const afterWindow = await Quotation.findById(lapsing.quotationId).lean();
+    check("a lapsed window does NOT kill the quotation", () => {
+      assert.equal(afterWindow?.status, "pending");
+      assert.equal(afterWindow?.rejectionReason, undefined);
+    });
 
-    const lapsed = await Quotation.findById(lapsing.quotationId).lean();
-    check("a lapsed quotation is closed with its reason stated", () => {
-      // Left pending forever, it would be a pro waiting forever.
-      assert.equal(lapsed?.status, "rejected");
-      assert.match(lapsed?.rejectionReason ?? "", /expired/i);
+    const stillAcceptable = (await (
+      await call("POST", `/consumer/quotations/${lapsing.quotationId}/accept`,
+        undefined, custToken)
+    ).json()) as { status?: string; startOtp?: string | null };
+    check("the customer can still approve it after the window closes", () => {
+      // The window was the office's, not theirs.
+      assert.equal(stillAcceptable.status, "customer_accepted");
+      assert.match(stillAcceptable.startOtp ?? "", /^\d{4}$/);
+    });
+
+    const payTooEarly = await call(
+      "POST", `/consumer/bookings/${bookingId2}/pay`,
+      { paymentMethod: "cash" }, custToken,
+    );
+    check("a job that is not finished cannot be paid for", () => {
+      // The quoted work may still be withdrawn, and the agreement is to pay
+      // when the work is done.
+      assert.equal(payTooEarly.status, 409);
     });
   } finally {
     const mine = await Booking.find({ customerPhone: custPhone }).select({ _id: 1 }).lean();

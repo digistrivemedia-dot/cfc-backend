@@ -1,24 +1,35 @@
 import { Router } from "express";
-import { badRequest, conflict, forbidden, notConfigured, notFound } from "../../error";
+import { badRequest, conflict, forbidden, notFound } from "../../error";
+
+/** Paise as plain rupees for a timeline label or a notification body. */
+function rupees(paise: number): string {
+  return `₹${Math.round(paise / 100).toLocaleString("en-IN")}`;
+}
 import { actorOf, requireAuth } from "../../middleware/auth";
 import { Quotation, type QuotationDoc } from "../../models/quotation";
-import { Booking } from "../../models/booking";
-import { WalletEntry, walletBalance } from "../../models/wallet";
-import { newId } from "../../models/id";
+import { Booking, newJobOtp } from "../../models/booking";
+import { notify } from "../../models/notification";
 import { param } from "../../params";
 import { PUBLIC_PREFIX } from "../../uploads";
 
 /**
  * Customer 22–24 — the quotations waiting on this customer.
  *
- * The flow is what shapes this file: a pro raises a quotation, **the admin
- * approves it**, and only then does it reach the customer. So a customer never
- * sees a `pending` one — that status means "waiting on the office", and showing
- * it would invite them to accept something CFC has not yet agreed to.
+ * The flow is what shapes this file, and it changed: a pro raises a quotation
+ * and it comes **straight here**. There is no approval gate. `pending` used to
+ * mean "waiting on the office" and was hidden from the customer; it now means
+ * the opposite — *their* decision is the one outstanding — so it is the main
+ * thing this file serves.
  *
- * **No customer-side countdown.** The 15 minutes is an *admin* rule ("the pro
- * cannot wait longer"). No customer deadline is documented, so none is shown —
- * a timer here would be a pressure tactic we invented.
+ * **There is no advance.** Accepting moves no money: the customer pays the
+ * whole amount when the job is finished, alongside the booking. So accepting is
+ * an agreement, and the only thing it produces is the code that lets the
+ * professional begin.
+ *
+ * **No customer-side countdown.** The 15 minutes is the office's window to
+ * change the figures, not a deadline on the customer. No customer deadline is
+ * documented, so none is shown — a timer here would be a pressure tactic we
+ * invented.
  */
 export const consumerQuotationsRouter = Router();
 
@@ -30,8 +41,23 @@ consumerQuotationsRouter.use(requireAuth, (req, _res, next) => {
   next();
 });
 
-/** What the customer may see. `pending` is deliberately absent. */
-const VISIBLE = ["approved", "rejected", "customer_accepted", "customer_declined"];
+/**
+ * What the customer may see: **everything**.
+ *
+ * `pending` is now theirs to decide on, and `approved` survives only on rows
+ * taken under the old flow — treated identically, so a quotation approved last
+ * week does not become unreachable.
+ */
+const VISIBLE = [
+  "pending",
+  "approved",
+  "rejected",
+  "customer_accepted",
+  "customer_declined",
+];
+
+/** The two statuses a customer may still act on. */
+const DECIDABLE = ["pending", "approved"];
 
 function project(q: QuotationDoc) {
   return {
@@ -55,11 +81,27 @@ function project(q: QuotationDoc) {
       ? { rejectionReason: q.rejectionReason }
       : {}),
 
-    // The 50% split, computed at approval so the figure shown when deciding is
-    // the figure charged.
-    advancePaise: q.advancePaise,
-    balancePaise: q.balancePaise,
-    advancePaid: q.advancePaid,
+    /**
+     * The code the customer reads out to let the quoted work begin.
+     *
+     * **Only ever on this projection.** The customer holds it; the pro's own
+     * projection (`projectQuotation` in `routes/pro/jobs.ts`) must never carry
+     * it, or the code proves nothing. Null before they confirm and null again
+     * once the pro has used it.
+     */
+    startOtp: q.startOtp,
+    /** So the screen can say "work under way" rather than only "accepted". */
+    workStarted: q.workStartedAt !== undefined,
+
+    /**
+     * Whether the office can still change these figures.
+     *
+     * Shown because it is the honest answer to "is this final?" — and because
+     * a customer who accepts while it is true has **locked it**, which is worth
+     * knowing. It stops being true the moment they accept.
+     */
+    officeMayStillEdit:
+      DECIDABLE.includes(q.status) && q.decisionBy.getTime() > Date.now(),
   };
 }
 
@@ -90,8 +132,6 @@ consumerQuotationsRouter.get("/:id", async (req, res) => {
     customerId: actorOf(req).id,
   }).lean<QuotationDoc>();
 
-  // A pending quotation has not cleared review, so as far as the customer is
-  // concerned it does not exist yet.
   if (!q || !VISIBLE.includes(q.status)) {
     throw notFound("That quotation could not be found.");
   }
@@ -99,24 +139,19 @@ consumerQuotationsRouter.get("/:id", async (req, res) => {
 });
 
 /**
- * Customer 23 — accept, paying the 50% advance.
+ * Customer 23 — approve the extra work.
  *
- * The advance is **real money moving**, so the payment method matters. Cash and
- * wallet work; UPI and card answer 503 until Razorpay has keys (§0.3) rather
- * than accepting the quote and pretending the advance was collected — a quote
- * marked accepted with no advance behind it would send a pro to do ₹4,000 of
- * work against nothing.
+ * **No money moves here.** The 50% advance is gone: the customer pays the whole
+ * quotation when the job is finished, with the booking. So this takes no
+ * payment method, debits no wallet, and answers no 503 — it is an agreement,
+ * and the only thing it produces is the code that lets the professional begin.
+ *
+ * Accepting also **locks the figures**. The office's 15-minute edit window may
+ * still be open, and it stops applying the moment this succeeds: what the
+ * customer read is what they pay.
  */
 consumerQuotationsRouter.post("/:id/accept", async (req, res) => {
   const customerId = actorOf(req).id;
-  const method = (req.body as { paymentMethod?: unknown })?.paymentMethod;
-
-  if (method !== "cash" && method !== "wallet" && method !== "upi" && method !== "card") {
-    throw badRequest("Choose how to pay the advance.", "BAD_PAYMENT_METHOD");
-  }
-  if (method === "upi" || method === "card") {
-    throw notConfigured("Online payment");
-  }
 
   const quote = await Quotation.findOne({
     _id: param(req, "id"),
@@ -124,52 +159,62 @@ consumerQuotationsRouter.post("/:id/accept", async (req, res) => {
   }).lean<QuotationDoc>();
   if (!quote) throw notFound("That quotation could not be found.");
 
-  if (quote.status !== "approved") {
+  if (!DECIDABLE.includes(quote.status)) {
     throw conflict(
       quote.status === "customer_accepted"
-        ? "You have already accepted this quotation."
-        : "That quotation is no longer open.",
+        ? "You have already approved this quotation."
+        : quote.status === "rejected"
+          ? "Our team withdrew this quotation."
+          : "That quotation is no longer open.",
       "BAD_STATE",
     );
   }
 
-  if (method === "wallet") {
-    const balance = await walletBalance(customerId);
-    if (balance < quote.advancePaise) {
-      throw conflict(
-        "Your wallet does not have enough balance for the advance.",
-        "INSUFFICIENT_BALANCE",
-      );
-    }
-  }
-
   const claimed = await Quotation.findOneAndUpdate(
-    // Guarded on the status, so a double-tap cannot charge the advance twice.
-    { _id: quote._id, status: "approved" },
+    // Guarded on the status it was read at, so a double-tap cannot produce two
+    // codes, and an office edit landing in between cannot be accepted blind.
+    { _id: quote._id, status: quote.status },
     {
       $set: {
         status: "customer_accepted",
         acceptedAt: new Date(),
-        // Cash is collected on site; a wallet advance has moved already.
-        advancePaid: method === "wallet",
+        /**
+         * The code that lets the quoted work start.
+         *
+         * Generated here, at the moment of agreement, and shown to the
+         * customer on the next screen so they can read it to the professional
+         * standing in front of them. Four digits, like the booking's own start
+         * code — it is read aloud at a doorstep and typed on a phone.
+         */
+        startOtp: newJobOtp(),
       },
     },
     { new: true },
   ).lean<QuotationDoc>();
 
-  if (!claimed) throw conflict("That quotation is no longer open.", "BAD_STATE");
-
-  if (method === "wallet") {
-    await WalletEntry.create({
-      _id: newId("wtx"),
-      customerId,
-      kind: "booking",
-      label: `Advance — ${quote.serviceName}`,
-      amountPaise: -quote.advancePaise,
-      bookingReference: quote.jobRef,
-      status: "completed",
-    });
+  if (!claimed) {
+    throw conflict(
+      "That quotation changed just now. Open it again and check the amount.",
+      "BAD_STATE",
+    );
   }
+
+  /**
+   * The quoted work joins the booking's payable money.
+   *
+   * Until this existed an accepted quotation reached nothing: `grossFor` summed
+   * the service, add-ons and on-site extras, and the quotation total appeared
+   * in no money path at all — so a pro could do ₹3,700 of agreed work and be
+   * settled for the original booking.
+   *
+   * `$inc` rather than a set, because a long job can carry more than one
+   * quotation. `breakdown` is deliberately untouched: that is the tax invoice
+   * as issued, and quoted work is its own line.
+   */
+  await Booking.updateOne(
+    { _id: quote.bookingId },
+    { $inc: { quotedWorkPaise: claimed.totalPaise } },
+  );
 
   await Booking.updateOne(
     { _id: quote.bookingId },
@@ -177,14 +222,33 @@ consumerQuotationsRouter.post("/:id/accept", async (req, res) => {
       $push: {
         events: {
           at: new Date(),
-          label: `Quotation accepted — 50% advance ${
-            method === "wallet" ? "paid from wallet" : "due in cash"
-          }`,
+          label: `Quotation approved by you — ${rupees(claimed.totalPaise)}. Code issued to start the work; payable when the job is done.`,
           actor: "Customer",
         },
       },
     },
   );
+
+  /**
+   * Tell the professional. **Nothing did.**
+   *
+   * They are standing in the customer's house waiting on this answer — it is
+   * the whole reason the 15-minute window exists — and the accept wrote a
+   * timeline event the pro never reads. Their own app polls the job, so they
+   * would have found out eventually; a pro who has been told explicitly can
+   * ask for the code instead of refreshing a screen.
+   *
+   * It names the code without carrying it: the code is the customer's to read
+   * aloud, and a notification is the last place to put it.
+   */
+  await notify({
+    role: "pro",
+    to: claimed.proId,
+    kind: "quotation",
+    title: "Quotation approved — ask for the code",
+    body: `The customer approved ${claimed.jobRef}. Ask them for the 4-digit code on their screen to start the work. They pay on completion.`,
+    href: `/jobs/${claimed.bookingId}/quote/status`,
+  });
 
   res.json(project(claimed));
 });
@@ -199,7 +263,7 @@ consumerQuotationsRouter.post("/:id/decline", async (req, res) => {
   const customerId = actorOf(req).id;
 
   const declined = await Quotation.findOneAndUpdate(
-    { _id: param(req, "id"), customerId, status: "approved" },
+    { _id: param(req, "id"), customerId, status: { $in: DECIDABLE } },
     { $set: { status: "customer_declined", declinedAt: new Date() } },
     { new: true },
   ).lean<QuotationDoc>();
@@ -220,6 +284,17 @@ consumerQuotationsRouter.post("/:id/decline", async (req, res) => {
       },
     },
   );
+
+  // Same reason as the accept: the pro is on site waiting, and "do not do the
+  // work" is the more urgent of the two messages to get to them.
+  await notify({
+    role: "pro",
+    to: declined.proId,
+    kind: "quotation",
+    title: "Quotation declined",
+    body: `The customer declined the extra work on ${declined.jobRef}. Finish what the original booking covers.`,
+    href: `/jobs/${declined.bookingId}/quote/status`,
+  });
 
   res.json(project(declined));
 });

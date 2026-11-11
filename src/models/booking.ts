@@ -137,6 +137,28 @@ export interface BookingDoc {
   extraCharges: { id: string; label: string; amountPaise: number; at: Date }[];
 
   /**
+   * Quoted work the customer has accepted, in paise. **Additive and frozen.**
+   *
+   * Set when a customer accepts a quotation, and the reason it lives here
+   * rather than being read back off the Quotation collection is the same
+   * reason `breakdown` is frozen: this figure is settled money. It feeds
+   * `grossFor`, so it feeds the pro's earnings and CFC's commission, and a
+   * settlement that moves when somebody edits a quotation record afterwards is
+   * not a settlement.
+   *
+   * **`breakdown` is deliberately not touched.** That is the customer's tax
+   * invoice as issued, and rewriting it to absorb later work would rewrite a
+   * tax document. Quoted work is its own line, which is also how the customer
+   * reads it: what they booked, and what was added on site with their
+   * agreement.
+   *
+   * Accumulates, because a long job can have more than one quotation over its
+   * life — a revision after a rejection, or a second fault found behind the
+   * first.
+   */
+  quotedWorkPaise: number;
+
+  /**
    * Where the pro was when they closed the job, and how far that was.
    *
    * `completionDistanceM` is null when the device could get no fix — which does
@@ -245,6 +267,8 @@ const bookingSchema = new Schema<BookingDoc>(
       ],
       default: [],
     },
+
+    quotedWorkPaise: { type: Number, default: 0 },
 
     completionDistanceM: { type: Number, default: null },
     completedAt: { type: Date },

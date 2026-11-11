@@ -18,6 +18,12 @@ import { newId } from "../../models/id";
 import { durationMinutes, priceBooking } from "../../services/pricing";
 import { dispatch } from "../../services/dispatch";
 import { getSettings } from "../../models/settings";
+import { Quotation, type QuotationDoc } from "../../models/quotation";
+
+/** Paise as plain rupees, for a timeline label. */
+function rupeesOf(paise: number): string {
+  return `₹${Math.round(paise / 100).toLocaleString("en-IN")}`;
+}
 import { PUBLIC_PREFIX } from "../../uploads";
 
 /**
@@ -576,8 +582,143 @@ function projectBooking(b: BookingDoc) {
     afterPhotoUrls: b.afterPhotoPaths.map((p) => `${PUBLIC_PREFIX}/${p}`),
     events: b.events.map((e) => ({ at: e.at.toISOString(), label: e.label })),
     rated: b.rated,
+
+    /**
+     * Charges added on site, and work added by an accepted quotation.
+     *
+     * **`totalPaise` above is the frozen booking total and always was.** That
+     * is right for the tax invoice and wrong for the only question a customer
+     * actually asks on this screen: *what do I owe?* Neither an on-site extra
+     * charge nor an accepted quotation appeared anywhere in this projection, so
+     * a customer who agreed to a ₹250 valve and a ₹5,000 repair was still shown
+     * the original booking total as their total.
+     *
+     * Sent as their own figures rather than folded into `totalPaise`, because
+     * the invoice reads that one and a tax document must not move.
+     */
+    extraChargesPaise: b.extraCharges.reduce((t, c) => t + c.amountPaise, 0),
+    extraCharges: b.extraCharges.map((c) => ({
+      label: c.label,
+      amountPaise: c.amountPaise,
+    })),
+    quotedWorkPaise: b.quotedWorkPaise ?? 0,
+
+    /**
+     * What the whole job comes to, and what is still outstanding.
+     *
+     * Arithmetic, not a new money rule: the booking as invoiced, plus what was
+     * agreed on site, less what has already been taken. GST stays on the
+     * platform fee only — quoted work is the pro's labour and materials, and
+     * `PLATFORM-FACTS` is explicit that GST never attaches to those.
+     */
+    amountPayablePaise:
+      b.breakdown.totalPaise +
+      b.extraCharges.reduce((t, c) => t + c.amountPaise, 0) +
+      (b.quotedWorkPaise ?? 0),
+    /**
+     * What has already been taken.
+     *
+     * `paid` is a boolean over the **whole booking**: a cash job is settled in
+     * one go at the door, quoted work included, and a wallet booking paid its
+     * own total when it was placed. So a paid booking owes nothing, and an
+     * unpaid one owes everything except what a wallet already covered.
+     */
+    amountPaidPaise: b.paid
+      ? b.breakdown.totalPaise +
+        b.extraCharges.reduce((t, c) => t + c.amountPaise, 0) +
+        (b.quotedWorkPaise ?? 0)
+      : b.paymentMethod === "wallet"
+        ? b.breakdown.totalPaise
+        : 0,
+    /** Filled in by `attachQuotation`. */
+    quotation: null as ConsumerBookingQuotation | null,
   };
 }
+
+/**
+ * The quotation on a booking, as the customer who must decide on it sees it.
+ *
+ * It lives on the booking because that is where the customer looks. The
+ * quotation had its own screen and its own notification and **nothing else** —
+ * so a customer who opened their booking instead of the notification saw no
+ * sign that a professional was standing in their house waiting on a ₹5,000
+ * decision, and no way to reach the screen that would let them make it.
+ */
+interface ConsumerBookingQuotation {
+  id: string;
+  status: string;
+  totalPaise: number;
+  /** What the pro found, so the booking page can say why this exists. */
+  proNotes: string;
+  /** The code to read out. Null before they confirm, null again once spent. */
+  startOtp: string | null;
+  workStarted: boolean;
+  /** Set when the office sent it back, so the customer is not left guessing. */
+  rejectionReason: string | null;
+}
+
+/**
+ * Attaches each booking's latest quotation, and finishes the money.
+ *
+ * One query for the whole page.
+ */
+async function attachQuotation<
+  T extends {
+    id: string;
+    amountPaidPaise: number;
+    quotation: ConsumerBookingQuotation | null;
+  },
+>(rows: T[]): Promise<T[]> {
+  if (rows.length === 0) return rows;
+
+  const quotes = await Quotation.find({
+    bookingId: { $in: rows.map((r) => r.id) },
+    status: { $in: VISIBLE_TO_CUSTOMER },
+  })
+    // Newest first, so the first per booking is the one that counts: a rejected
+    // quote can be revised and what matters is where things stand now.
+    .sort({ createdAt: -1 })
+    .lean<QuotationDoc[]>();
+
+  const byBooking = new Map<string, QuotationDoc>();
+  for (const q of quotes) {
+    if (!byBooking.has(q.bookingId)) byBooking.set(q.bookingId, q);
+  }
+
+  return rows.map((row) => {
+    const q = byBooking.get(row.id);
+    if (!q) return row;
+
+    return {
+      ...row,
+      quotation: {
+        id: q._id,
+        status: q.status,
+        totalPaise: q.totalPaise,
+        proNotes: q.proNotes,
+        startOtp: q.startOtp,
+        workStarted: q.workStartedAt !== undefined,
+        rejectionReason: q.rejectionReason ?? null,
+      },
+    };
+  });
+}
+
+/**
+ * What a customer may see of a quotation: **everything**.
+ *
+ * `pending` used to be excluded because it meant "waiting on the office". It
+ * now means the customer's own decision is outstanding, which is precisely
+ * what this booking page has to tell them. `approved` survives only on rows
+ * taken under the old approval flow.
+ */
+const VISIBLE_TO_CUSTOMER = [
+  "pending",
+  "approved",
+  "rejected",
+  "customer_accepted",
+  "customer_declined",
+];
 
 /**
  * The pro, as the customer who booked them sees it.
@@ -688,7 +829,9 @@ consumerBookingRouter.get("/", async (req, res) => {
     .sort({ scheduledAt: -1 })
     .lean<BookingDoc[]>();
 
-  res.json(await attachPro(rows.map(projectBooking), rows));
+  res.json(
+    await attachQuotation(await attachPro(rows.map(projectBooking), rows)),
+  );
 });
 
 consumerBookingRouter.get("/counts", async (req, res) => {
@@ -745,7 +888,9 @@ consumerBookingRouter.get("/active", async (req, res) => {
     res.json(null);
     return;
   }
-  const [withPro] = await attachPro([projectBooking(first)], [first]);
+  const [withPro] = await attachQuotation(
+    await attachPro([projectBooking(first)], [first]),
+  );
   res.json(withPro ?? null);
 });
 
@@ -797,7 +942,9 @@ consumerBookingRouter.get("/:id", async (req, res) => {
   }).lean<BookingDoc>();
 
   if (!found) throw notFound("That booking could not be found.");
-  const [withPro] = await attachPro([projectBooking(found)], [found]);
+  const [withPro] = await attachQuotation(
+    await attachPro([projectBooking(found)], [found]),
+  );
   res.json(withPro);
 });
 
@@ -809,6 +956,129 @@ consumerBookingRouter.get("/:id", async (req, res) => {
  * outstanding. A fee invented here would be a developer setting commercial
  * terms. A wallet booking is refunded in full for the same reason.
  */
+/**
+ * Customer 29 → 30 — settle the job once it is finished.
+ *
+ * ## Why this exists
+ *
+ * There was **no way for a customer to pay anything after booking**. A cash
+ * booking was marked paid by the completion itself, a wallet booking paid its
+ * total up front, and the two online methods refused at checkout — so nothing
+ * ever needed a payment step. Quoted work broke that: it is agreed *during* the
+ * job and, with the 50% advance removed, every rupee of it falls due at
+ * completion. A wallet customer who approved ₹3,700 of extra work had an
+ * outstanding balance and no button.
+ *
+ * ## What each method does
+ *
+ * | Method | Behaviour |
+ * |---|---|
+ * | `cash` | The professional collects at the door. Recorded here because the customer is the one holding a phone at that moment. |
+ * | `wallet` | Debited now, and **refused if the balance is short** rather than part-paying. |
+ * | `upi`, `card` | **503 `NOT_CONFIGURED`.** Razorpay has no keys in this deployment. |
+ *
+ * The online methods answer honestly rather than marking a job paid against
+ * nothing. §0.3 is firm about why: a stub that auto-succeeds is how an
+ * unverified signature check reaches production, and here it would also tell a
+ * professional they had been paid when they had not.
+ *
+ * Only on a **completed** job. Before that there is nothing to settle: the
+ * quoted work may still be cancelled, and the agreement is to pay when the
+ * work is done.
+ */
+consumerBookingRouter.post("/:id/pay", async (req, res) => {
+  const customerId = actorOf(req).id;
+  const method = (req.body as { paymentMethod?: unknown })?.paymentMethod;
+
+  if (
+    method !== "cash" &&
+    method !== "wallet" &&
+    method !== "upi" &&
+    method !== "card"
+  ) {
+    throw badRequest("Choose how you would like to pay.", "BAD_PAYMENT_METHOD");
+  }
+  if (method === "upi" || method === "card") throw notConfigured("Online payment");
+
+  const booking = await Booking.findOne({
+    _id: req.params.id,
+    customerId,
+  }).lean<BookingDoc>();
+  if (!booking) throw notFound("That booking could not be found.");
+
+  if (booking.status !== "completed") {
+    throw conflict(
+      "You can pay once the professional has finished the job.",
+      "NOT_COMPLETED",
+    );
+  }
+  if (booking.paid) {
+    throw conflict("This job has already been paid for.", "ALREADY_PAID");
+  }
+
+  const extras = booking.extraCharges.reduce((t, c) => t + c.amountPaise, 0);
+  const payable =
+    booking.breakdown.totalPaise + extras + (booking.quotedWorkPaise ?? 0);
+  // A wallet booking already paid its own total when it was placed.
+  const alreadyPaid =
+    booking.paymentMethod === "wallet" ? booking.breakdown.totalPaise : 0;
+  const duePaise = payable - alreadyPaid;
+
+  if (duePaise <= 0) {
+    // Nothing outstanding. Marked settled rather than left looking unpaid.
+    await Booking.updateOne({ _id: booking._id }, { $set: { paid: true } });
+    res.json({ paid: true, duePaise: 0 });
+    return;
+  }
+
+  if (method === "wallet") {
+    const balance = await walletBalance(customerId);
+    if (balance < duePaise) {
+      throw conflict(
+        "Your wallet does not have enough balance for this. Add money, or pay the professional in cash.",
+        "INSUFFICIENT_BALANCE",
+      );
+    }
+  }
+
+  const settled = await Booking.findOneAndUpdate(
+    // Guarded on `paid`, so a double-tap cannot debit a wallet twice.
+    { _id: booking._id, customerId, paid: false },
+    {
+      $set: { paid: true },
+      $push: {
+        events: {
+          at: new Date(),
+          label:
+            method === "wallet"
+              ? `Paid ${rupeesOf(duePaise)} from wallet`
+              : `Paid ${rupeesOf(duePaise)} in cash to the professional`,
+          actor: "Customer",
+        },
+      },
+    },
+    { new: true },
+  ).lean<BookingDoc>();
+
+  if (!settled) throw conflict("This job has already been paid for.", "ALREADY_PAID");
+
+  if (method === "wallet") {
+    // A debit is negative, so the balance stays a sum. Written after the
+    // booking is settled, so there is never a debit with nothing behind it.
+    await WalletEntry.create({
+      _id: newId("wtx"),
+      customerId,
+      kind: "booking",
+      label: `${booking.serviceName} — final payment`,
+      amountPaise: -duePaise,
+      bookingReference: booking.reference,
+      status: "completed",
+    });
+  }
+
+  res.json({ paid: true, duePaise, paidWith: method });
+});
+
 consumerBookingRouter.post("/:id/cancel", async (req, res) => {
   const actor = actorOf(req);
   const { id } = req.params;
